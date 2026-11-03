@@ -1,8 +1,8 @@
 {
   "lib": {
     "name": "Unitree_GO",
-    "version": "1.0.0",
-    "description": "宇树 GO-M8010-6 关节电机驱动（半双工 RS485）+ Keil 工程一键配置工具",
+    "version": "1.1.0",
+    "description": "宇树 GO-M8010-6 关节电机驱动（半双工 RS485，DMA + 空闲中断接收）+ Keil 工程一键配置工具",
     "driver_files": ["Unitree_GO.c", "Unitree_GO.h"]
   },
 
@@ -40,6 +40,17 @@
     "priority": "osPriorityNormal"
   },
 
+  "dma": {
+    "controller": "DMA1",
+    "fallback": "DMA2",
+    "irq_priority": 5
+  },
+
+  "callbacks": {
+    "rx_event": "HAL_UARTEx_RxEventCallback",
+    "error": "HAL_UART_ErrorCallback"
+  },
+
   "defaults": {
     "channel": 1,
     "motor_id": 1,
@@ -59,7 +70,8 @@
       "rx_pin": 6,
       "de_port": "GPIOD",
       "de_pin": 4,
-      "af": "GPIO_AF7_USART2"
+      "af": "GPIO_AF7_USART2",
+      "dma_request": "DMA_REQUEST_USART2_RX"
     },
     "2": {
       "uart_index": 3,
@@ -69,7 +81,8 @@
       "rx_pin": 9,
       "de_port": "GPIOB",
       "de_pin": 14,
-      "af": "GPIO_AF7_USART3"
+      "af": "GPIO_AF7_USART3",
+      "dma_request": "DMA_REQUEST_USART3_RX"
     }
   },
 

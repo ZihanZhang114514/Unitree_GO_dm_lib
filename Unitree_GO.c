@@ -60,6 +60,52 @@ static void    Unitree_GO_DeSet(Unitree_GO_HandleTypeDef *motor, uint8_t transmi
 static void    Unitree_GO_DeTx(Unitree_GO_HandleTypeDef *motor);
 static void    Unitree_GO_DeRx(Unitree_GO_HandleTypeDef *motor);
 
+/*------------------------------------------------------------------------------
+ * 句柄表：DMA 空闲中断里只拿到一个 huart，需要靠这张表找回对应的电机句柄
+ *----------------------------------------------------------------------------*/
+static Unitree_GO_HandleTypeDef *s_motors[UNITREE_GO_MAX_MOTORS];
+static uint8_t                   s_motor_count = 0u;
+
+static void Unitree_GO_Register(Unitree_GO_HandleTypeDef *motor)
+{
+    uint8_t i;
+
+    for (i = 0u; i < s_motor_count; i++)
+    {
+        if (s_motors[i] == motor)
+        {
+            return;                     /* 重复 Init，不重复登记 */
+        }
+    }
+    if (s_motor_count < UNITREE_GO_MAX_MOTORS)
+    {
+        s_motors[s_motor_count++] = motor;
+    }
+}
+
+/* id 传 0xFF 表示“随便哪个挂在 huart 上的句柄”；否则要求 id 匹配 */
+static Unitree_GO_HandleTypeDef *Unitree_GO_Find(UART_HandleTypeDef *huart, uint8_t id)
+{
+    uint8_t i;
+
+    if (huart == NULL)
+    {
+        return NULL;
+    }
+
+    for (i = 0u; i < s_motor_count; i++)
+    {
+        if ((s_motors[i] != NULL) && (s_motors[i]->huart == huart))
+        {
+            if ((id == 0xFFu) || (s_motors[i]->id == id))
+            {
+                return s_motors[i];
+            }
+        }
+    }
+    return NULL;
+}
+
 /*==============================================================================
  * 初始化
  *============================================================================*/
@@ -114,8 +160,15 @@ void Unitree_GO_Init(Unitree_GO_HandleTypeDef *motor,
     motor->crc_err_cnt = 0u;
     motor->last_tick   = 0u;
 
+    motor->rx_armed    = 0u;
+    motor->rx_size     = 0u;
+    motor->rx_seq      = 0u;
+    motor->rx_seen     = 0u;
+    motor->error_cnt   = 0u;
+
     memset(motor->tx_buf, 0, sizeof(motor->tx_buf));
     memset(motor->rx_buf, 0, sizeof(motor->rx_buf));
+    memset(motor->rx_dma_buf, 0, sizeof(motor->rx_dma_buf));
 
     /* 485 收发方向脚：推挽输出，初始切到接收方向 */
     if (de_port != NULL)
@@ -135,6 +188,10 @@ void Unitree_GO_Init(Unitree_GO_HandleTypeDef *motor,
 
         Unitree_GO_DeSet(motor, 0u);    /* 0 = 接收方向 */
     }
+
+    /* 登记到句柄表，并立刻武装 DMA 接收（没配 DMA 时这里会安全地什么都不做） */
+    Unitree_GO_Register(motor);
+    Unitree_GO_StartRx(motor);
 }
 
 /*==============================================================================
@@ -288,9 +345,144 @@ void Unitree_GO_SetZeroPosition(Unitree_GO_HandleTypeDef *motor)
 }
 
 /*==============================================================================
+ * 接收：DMA + 空闲中断
+ *============================================================================*/
+void Unitree_GO_StartRx(Unitree_GO_HandleTypeDef *motor)
+{
+    if ((motor == NULL) || (motor->huart == NULL))
+    {
+        return;
+    }
+
+#if (UNITREE_GO_RX_USE_DMA != 0)
+    motor->rx_armed = 0u;
+
+    if (motor->huart->hdmarx == NULL)
+    {
+        return;         /* 工程没配 DMA：由 Poll() 退回阻塞接收 */
+    }
+
+    /* 上一次还没结束（正常流程里不会，保险起见）先中止 */
+    if (motor->huart->RxState != HAL_UART_STATE_READY)
+    {
+        (void)HAL_UART_AbortReceive(motor->huart);
+    }
+
+    Unitree_GO_ClearRx(motor);          /* 清 ORE/FE/NE/PE 和半个字节 */
+    memset(motor->rx_dma_buf, 0, sizeof(motor->rx_dma_buf));
+    motor->rx_size = 0u;
+
+    if (HAL_UARTEx_ReceiveToIdle_DMA(motor->huart, motor->rx_dma_buf,
+                                     (uint16_t)sizeof(motor->rx_dma_buf)) == HAL_OK)
+    {
+        motor->rx_armed = 1u;
+        /* 只要 IDLE，不要半传输中断：16 字节的帧用不着 HT，关掉少进一次中断 */
+        __HAL_DMA_DISABLE_IT(motor->huart->hdmarx, DMA_IT_HT);
+    }
+    else
+    {
+        motor->error_cnt++;
+    }
+#else
+    (void)motor;
+#endif
+}
+
+void Unitree_GO_StopRx(Unitree_GO_HandleTypeDef *motor)
+{
+    if ((motor == NULL) || (motor->huart == NULL))
+    {
+        return;
+    }
+
+    motor->rx_armed = 0u;
+
+#if (UNITREE_GO_RX_USE_DMA != 0)
+    if (motor->huart->RxState != HAL_UART_STATE_READY)
+    {
+        (void)HAL_UART_AbortReceive(motor->huart);
+    }
+#endif
+}
+
+/* 空闲中断入口：在工程的 HAL_UARTEx_RxEventCallback() 里调这个 */
+void Unitree_GO_RxEvent(UART_HandleTypeDef *huart, uint16_t size)
+{
+    Unitree_GO_HandleTypeDef *owner;
+    Unitree_GO_HandleTypeDef *target;
+    uint16_t i;
+    uint8_t  found = 0u;
+
+    if (huart == NULL)
+    {
+        return;
+    }
+
+    owner = Unitree_GO_Find(huart, 0xFFu);
+    if (owner == NULL)
+    {
+        return;
+    }
+
+    owner->rx_size = size;
+
+    if (size >= UNITREE_GO_RX_LEN)
+    {
+        /* 在缓冲里找 0xFD 0xEE 帧头：半双工回波、残包都可能让数据不对齐 */
+        for (i = 0u; (uint16_t)(i + UNITREE_GO_RX_LEN) <= size; i++)
+        {
+            if ((owner->rx_dma_buf[i] == 0xFD) && (owner->rx_dma_buf[i + 1u] == 0xEE))
+            {
+                /* 按帧里的 ID 分发：同一路 485 上挂多个电机时各回各的 */
+                target = Unitree_GO_Find(huart,
+                                         (uint8_t)(owner->rx_dma_buf[i + 2u] & 0x0Fu));
+                if (target == NULL)
+                {
+                    target = owner;
+                }
+                (void)Unitree_GO_ParseData(target, &owner->rx_dma_buf[i]);
+                found = 1u;
+                break;
+            }
+        }
+    }
+
+    if ((found == 0u) && (size != 0u))
+    {
+        owner->crc_err_cnt++;           /* 收到东西但没有合法帧：噪声 / 回波 / 错帧 */
+    }
+
+    /* IDLE 之后 HAL 已经结束了本次接收，必须重新武装才能收下一帧 */
+    Unitree_GO_StartRx(owner);
+}
+
+/* 串口错误入口：在工程的 HAL_UART_ErrorCallback() 里调这个 */
+void Unitree_GO_Error(UART_HandleTypeDef *huart)
+{
+    Unitree_GO_HandleTypeDef *owner;
+
+    if (huart == NULL)
+    {
+        return;
+    }
+
+    owner = Unitree_GO_Find(huart, 0xFFu);
+    if (owner == NULL)
+    {
+        return;
+    }
+
+    owner->error_cnt++;
+    owner->correct = 0u;
+
+    /* ORE/FE/NE 之后 HAL 已经停了接收，重新武装 */
+    Unitree_GO_StartRx(owner);
+}
+
+/*==============================================================================
  * 通讯
  *============================================================================*/
-uint8_t Unitree_GO_SendRecv(Unitree_GO_HandleTypeDef *motor)
+uint8_t Unitree_GO_Send(Unitree_GO_HandleTypeDef *motor)
 {
     if ((motor == NULL) || (motor->huart == NULL))
     {
@@ -298,7 +490,12 @@ uint8_t Unitree_GO_SendRecv(Unitree_GO_HandleTypeDef *motor)
     }
 
     Unitree_GO_BuildFrame(motor);
-    Unitree_GO_ClearRx(motor);
+
+    /* 发送前把“已消费帧号”对齐，避免用上一轮残留的反馈冒充这一轮的回包 */
+    motor->rx_seen = motor->rx_seq;
+
+    /* 半双工：发送期间先关接收，避免把自己发的回波当成电机回包 */
+    Unitree_GO_StopRx(motor);
 
     /* 485 切发送，发完（HAL_UART_Transmit 返回时 TC 已置位）再切回接收 */
     Unitree_GO_DeTx(motor);
@@ -306,56 +503,78 @@ uint8_t Unitree_GO_SendRecv(Unitree_GO_HandleTypeDef *motor)
                           UNITREE_GO_TX_TIMEOUT_MS) != HAL_OK)
     {
         Unitree_GO_DeRx(motor);
+        Unitree_GO_StartRx(motor);
         motor->correct = 0u;
         motor->timeout_cnt++;
         return 0u;
     }
     Unitree_GO_DeRx(motor);
 
-    /* 广播(id=15)时总线没有回包，直接返回发送结果，别在这里白等超时 */
-    if (motor->id == UNITREE_GO_ID_BROADCAST)
-    {
-        return 1u;
-    }
-
-    /* 有些 485 收发芯片的接收使能没跟着 DE 关，发送期间会把自己发的字节又收回来，
-     * 这里在正式等回包前再清一次，避免把自己的包当成电机回包（电机的回包至少
-     * 要等它收完+校验+处理，远晚于这几个指令周期，清不坏真回包）。 */
-    Unitree_GO_ClearRx(motor);
-
-    if (HAL_UART_Receive(motor->huart, motor->rx_buf, UNITREE_GO_RX_LEN,
-                         UNITREE_GO_RX_TIMEOUT_MS) != HAL_OK)
-    {
-        motor->correct = 0u;
-        motor->timeout_cnt++;
-        return 0u;
-    }
-
-    return Unitree_GO_ParseData(motor, motor->rx_buf);
+    /* 立刻重新武装 DMA：电机回包由 IDLE 中断收进来 */
+    Unitree_GO_StartRx(motor);
+    return 1u;
 }
 
-/* 只发不收：广播(id=15)、编码器标定命令用 */
+/* 旧名字：等价 Unitree_GO_Send()（发送本身就不等回包） */
 uint8_t Unitree_GO_SendOnly(Unitree_GO_HandleTypeDef *motor)
+{
+    return Unitree_GO_Send(motor);
+}
+
+uint8_t Unitree_GO_Poll(Unitree_GO_HandleTypeDef *motor)
 {
     if ((motor == NULL) || (motor->huart == NULL))
     {
         return 0u;
     }
 
-    Unitree_GO_BuildFrame(motor);
-    Unitree_GO_ClearRx(motor);
-
-    Unitree_GO_DeTx(motor);
-    if (HAL_UART_Transmit(motor->huart, motor->tx_buf, UNITREE_GO_TX_LEN,
-                          UNITREE_GO_TX_TIMEOUT_MS) != HAL_OK)
+#if (UNITREE_GO_RX_USE_DMA != 0)
+    if (motor->rx_armed != 0u)
     {
-        Unitree_GO_DeRx(motor);
-        motor->timeout_cnt++;
+        if (motor->rx_seq != motor->rx_seen)
+        {
+            motor->rx_seen = motor->rx_seq;
+            return 1u;
+        }
         return 0u;
     }
-    Unitree_GO_DeRx(motor);
+#endif
+    /* 兜底：没有 DMA（或武装失败）时退回阻塞接收，最坏 1 ms */
+    if (HAL_UART_Receive(motor->huart, motor->rx_buf, UNITREE_GO_RX_LEN,
+                         UNITREE_GO_RX_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0u;
+    }
+    return Unitree_GO_ParseData(motor, motor->rx_buf);
+}
 
-    return 1u;
+uint8_t Unitree_GO_SendRecv(Unitree_GO_HandleTypeDef *motor)
+{
+    uint32_t t0;
+
+    if (Unitree_GO_Send(motor) == 0u)
+    {
+        return 0u;
+    }
+
+    /* 广播(id=15)时总线没有回包，别在这里白等超时 */
+    if (motor->id == UNITREE_GO_ID_BROADCAST)
+    {
+        return 1u;
+    }
+
+    t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) <= UNITREE_GO_RX_WAIT_MS)
+    {
+        if (Unitree_GO_Poll(motor) != 0u)
+        {
+            return 1u;
+        }
+    }
+
+    motor->correct = 0u;
+    motor->timeout_cnt++;
+    return 0u;
 }
 
 /* 解析一帧 16 字节反馈：1 = 有效帧，0 = 帧头/CRC 错 */
@@ -410,6 +629,7 @@ uint8_t Unitree_GO_ParseData(Unitree_GO_HandleTypeDef *motor, const uint8_t *dat
     motor->correct   = 1u;
     motor->ok_cnt++;
     motor->last_tick = HAL_GetTick();
+    motor->rx_seq++;                    /* 通知 Poll()/SendRecv()：有新的一帧了 */
 
     return 1u;
 }

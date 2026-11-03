@@ -1,12 +1,12 @@
 # Unitree_GO_dm_lib
 
-宇树 **GO-M8010-6** 关节电机驱动（STM32 · 半双工 RS485）＋ **Keil MDK 工程一键配置工具**（Python + tkinter GUI）。
+宇树 **GO-M8010-6** 关节电机驱动（STM32 · 半双工 RS485 · **DMA + 空闲中断接收**）＋ **Keil MDK 工程一键配置工具**（Python + tkinter GUI）。
 
-输入一个 `MDK-ARM` 目录，点一下按钮，工具就会把驱动、移植层、FreeRTOS 线程和 Keil 工程配置全部装好，并自动备份所有被改动的文件。
+输入一个 `MDK-ARM` 目录，点一下按钮，工具就会把驱动、移植层（含串口 / DMA / 中断 / 回调）、FreeRTOS 线程和 Keil 工程配置全部装好，并自动备份所有被改动的文件。
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Unitree_GO 一键配置  v1.0.0                                │
+│  Unitree_GO 一键配置  v1.1.0                                │
 │                                                             │
 │  1. 选择 Keil 工程目录（MDK-ARM）                            │
 │  [ D:\27RC\dm_demo\MDK-ARM                     ] [浏览…] [仅检测] │
@@ -19,9 +19,9 @@
 │  [一键配置]  [打开备份目录]  [打开库目录]              [退出]│
 │                                                             │
 │  3. 日志                                                    │
-│  工程根目录 : D:\27RC\dm_demo                               │
-│  [写入] bsp\uper\Unitree_GO.c                               │
-│  [修改] Core\Src\freertos.c（插入 includes, prototypes, …）  │
+│  DMA 策略    : 生成（DMA1_Stream3 / DMA1_Stream3_IRQn）      │
+│  回调接线    : 工程已有 HAL 回调 -> 插转发                    │
+│  [写入] bsp\uper\Unitree_GO_port.c                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -33,11 +33,12 @@
 2. [快速开始](#2-快速开始)
 3. [工具具体改了什么](#3-工具具体改了什么)
 4. [config.json 说明](#4-configjson-说明)
-5. [生成的移植层](#5-生成的移植层unitree_go_portch)
-6. [驱动 API](#6-驱动-api)
-7. [报文协议](#7-报文协议)
-8. [故障排查](#8-故障排查)
-9. [FAQ](#9-faq)
+5. [串口与 DMA 配置（重点）](#5-串口与-dma-配置重点)
+6. [生成的移植层](#6-生成的移植层unitree_go_portch)
+7. [驱动 API](#7-驱动-api)
+8. [报文协议](#8-报文协议)
+9. [故障排查](#9-故障排查)
+10. [FAQ](#10-faq)
 
 ---
 
@@ -46,20 +47,20 @@
 ```
 Unitree_GO_dm_lib/
 ├── README.md                        ← 本文件
-├── config.json                      ← 工具配置（路径/锚点/默认值）
-├── Unitree_GO.c                     ← 驱动实现（582 行）
-├── Unitree_GO.h                     ← 驱动头文件（209 行）
+├── config.json                      ← 工具配置（路径/锚点/DMA/默认值）
+├── Unitree_GO.c                     ← 驱动实现
+├── Unitree_GO.h                     ← 驱动头文件
 └── Unitree_GO_configurator.py       ← 一键配置工具（GUI + CLI）
 ```
 
-驱动被分成两层：
+驱动分两层：
 
-| 层 | 文件 | 谁维护 |
-|---|---|---|
-| 协议层 | `Unitree_GO.c/.h` | 本库，跨工程通用，不含任何板级引脚 |
-| 移植层 | `Unitree_GO_port.c/.h`（**由工具生成到目标工程**） | 每个工程一份，绑定具体串口/引脚/任务参数 |
+| 层 | 文件 | 谁维护 | 内容 |
+|---|---|---|---|
+| 协议层 | `Unitree_GO.c/.h` | 本库，跨工程通用 | 组帧/解帧、CRC、定标、模式、**DMA 空闲中断收发**、按 ID 分发 |
+| 移植层 | `Unitree_GO_port.c/.h`（**工具生成到目标工程**） | 每个工程一份 | 4 Mbps 串口、485 方向脚、**DMA 通道**、中断入口、HAL 回调、示例任务 |
 
-这样换板子只改移植层，协议层一行不用动。
+换板子只改移植层，协议层一行不用动。
 
 ---
 
@@ -67,33 +68,34 @@ Unitree_GO_dm_lib/
 
 ### 2.1 环境
 
-- Windows + Python 3.8 以上（官方安装包自带 `tkinter`，无需 pip 安装任何东西）
-- 目标工程：STM32CubeMX 生成 + Keil MDK（STM32H7xx HAL + FreeRTOS + `cmsis_os.h`）
+- Windows + Python 3.8 以上（官方安装包自带 `tkinter`，无需 pip 安装）
+- 目标工程：STM32CubeMX + Keil MDK（STM32H7xx HAL + FreeRTOS + `cmsis_os.h`）
 - 板子：DM-MC-Board02（或任何有 USART2/USART3 + RS485 方向脚的板子）
+- **接收要 DMA**：工具会自动配好；如果你自己在 CubeMX 里配，见[第 5 章](#5-串口与-dma-配置重点)
 
-### 2.2 方式一：GUI
+### 2.2 GUI
 
 ```bat
 python Unitree_GO_configurator.py
 ```
 
-1. 点「浏览…」选中工程的 `MDK-ARM` 目录（填工程根目录也行，工具会自动往下找）；
+1. 「浏览…」选中工程的 `MDK-ARM` 目录（填工程根目录也行，工具会自动往下找）；
 2. 选 485 通道（默认 1）；
 3. 填电机 ID（**必须和电机里烧的一致**，出厂未设置时是 15）；
 4. 点「一键配置」。
 
 日志里出现 `配置完成` 就结束了，接着用 Keil 打开 `.uvprojx`，**Rebuild**。
 
-> 不确定工程状态时，先点「仅检测」或勾上「只检查不写入」，工具会把检测结果和将要做的事列出来，不改任何文件。
+> 不确定工程状态时先点「仅检测」，或勾「只检查不写入」，工具会把检测结果（串口策略 / DMA 策略 / 回调接线）和将要做的事都列出来，不改任何文件。
 
-### 2.3 方式二：命令行
+### 2.3 命令行
 
 ```bat
 :: 配置（默认通道 1、ID 1）
 python Unitree_GO_configurator.py --mdkarm "D:\27RC\dm_demo\MDK-ARM"
 
 :: 先看要改什么
-python Unitree_GO_configurator.py --mdkarm "D:\27RC\dm_demo\MDK-ARM" --dry-run
+python Unitree_GO_configurator.py --mdkarm "..." --dry-run
 
 :: 换通道 / ID / 控制参数
 python Unitree_GO_configurator.py --mdkarm "..." --channel 2 --id 7 --pos 0.3 --kp 8 --kd 0.5
@@ -114,32 +116,32 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 | `--dry-run` | 只检查不写入 |
 | `--force` | 工程里已有别的 GO 接入代码时，仍强制生成移植层 |
 
-### 2.4 方式三：手工（不用脚本也能装）
+### 2.4 手工（不用脚本）
 
-1. 把 `Unitree_GO.c/.h` 拷到 `<工程>/bsp/uper/`；
-2. 在 `Unitree_GO.h` 里把 `UNITREE_GO_485_CHANNEL` 改成 1 或 2；
-3. 参考本库生成逻辑（`Unitree_GO_configurator.py` 里的 `_port_files()`）写一个 `Unitree_GO_port.c`：
-   4 Mbps 串口初始化 + `Unitree_GO_Init()` + 一个任务；
-4. Keil 工程里加入两个 `.c`，头文件路径加 `../bsp/uper`；
-5. `freertos.c` 的 USER CODE 区里 `osThreadNew(APP_Unitree_GO_Task, NULL, &attr)`。
+1. 把 `Unitree_GO.c/.h` 拷到 `<工程>/bsp/uper/`，改 `UNITREE_GO_485_CHANNEL`；
+2. 按第 5 章在 CubeMX 里配好串口 + DMA + NVIC（或照抄工具生成的 `Unitree_GO_port.c`）；
+3. 在 `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` 里各加一行转发；
+4. Keil 工程加入 `Unitree_GO.c`，头文件路径加 `../bsp/uper`；
+5. `freertos.c` 的 USER CODE 区里建线程。
 
 ---
 
 ## 3. 工具具体改了什么
 
-工具只做 4 件事，**全部幂等**（同一工程重复运行不会重复插入），且改动前先备份：
+工具做 5 件事，**全部幂等**（重复运行不会重复插入），改动前全部备份：
 
 | # | 目标 | 动作 | 备份 |
 |---|---|---|---|
 | 1 | `bsp/uper/Unitree_GO.c` `.h` | 复制（`.h` 里的通道宏按选择写入）。已有且内容相同 → 跳过 | 内容不同才备份 |
-| 2 | `bsp/uper/Unitree_GO_port.c` `.h` | 按当前选项生成/覆盖 | 有旧文件才备份 |
-| 3 | `Core/Src/freertos.c` | 在 4 个 `USER CODE` 区插入：`#include`、线程声明、线程属性、`osThreadNew()` | ✔ |
-| 4 | `R1.uvprojx` | 往 `bsp_upper` 组登记 `Unitree_GO.c` / `Unitree_GO_port.c`；给主 target 的 `IncludePath` 补 `../bsp/uper` | ✔ |
+| 2 | `bsp/uper/Unitree_GO_port.c` `.h` | 按当前选项生成/覆盖：**串口初始化 + DMA 初始化 + 中断入口 + HAL 回调 + 示例任务** | 有旧文件才备份 |
+| 3 | `app/usart_it.c` 等（工程里已有 HAL 回调时） | 在 `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` 函数体开头各插一行转发（+ 补 `#include`） | ✔ |
+| 4 | `Core/Src/freertos.c` | 在 4 个 `USER CODE` 区插入 `#include`、线程声明、线程属性、`osThreadNew()` | ✔ |
+| 5 | `R1.uvprojx` | 往 `bsp_upper` 组登记 `Unitree_GO.c` / `Unitree_GO_port.c`；给主 target 的 `IncludePath` 补 `../bsp/uper` | ✔ |
 
-- 备份位置：`<MDK-ARM>/Unitree_GO_backup/<yyyyMMdd_HHmmss>/`，保留原来的相对目录结构，并附 `install_report.txt`（本次改动明细 + 下一步提示）。
-- **只改 CubeMX 的 `USER CODE` 区**，所以之后用 CubeMX 重新生成代码时这些插入不会被冲掉；生成的 `Unitree_GO_port.*` 在 `bsp/uper/` 下，CubeMX 根本不碰。
-- 检测到工程里**已有别人写的** GO 电机接入代码（比如 `app/fdcan_it.c` 里的 `APP_Unitree_test`）时，为免两个任务抢同一路半双工 485，只同步驱动文件，不生成移植层和线程；确实要覆盖时加 `--force`。
-- 工程里已有 `huart2/huart3`（CubeMX 配过串口）时，移植层走**复用模式**：只借用句柄并把波特率校正到 4 Mbps；没有则自己建。两种模式在生成的 `Unitree_GO_port.c` 注释里写得清清楚楚。
+- 备份位置：`<MDK-ARM>/Unitree_GO_backup/<yyyyMMdd_HHmmss>/`，保留原相对目录结构，并附 `install_report.txt`。
+- **只改 CubeMX 的 `USER CODE` 区**，CubeMX 重新生成代码时插入不会被冲掉；生成的 `Unitree_GO_port.*` 在 `bsp/uper/` 下，CubeMX 不碰。
+- 检测到工程里**已有别人写的** GO 电机接入代码（例如 `app/fdcan_it.c` 里的 `APP_Unitree_test`）时，只同步驱动文件，不生成移植层/线程（避免两个任务抢同一路半双工 485）；此时驱动会自动退回阻塞接收（见 5.6），旧代码仍能跑。要覆盖请加 `--force`。
+- 串口/DMA 的"复用还是自己建"是**自动判断**的：工程已有 `huart2/huart3` → 复用；已有 `DMA_REQUEST_USART2_RX` → 复用 DMA；都没有 → 移植层自己建，并自动挑一个**空闲的 DMA 流**（跳过工程已用的流和已有中断函数的流）。
 
 ---
 
@@ -153,24 +155,194 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 | `layout.port_prefix` | 移植层文件名前缀 | `Unitree_GO_port` |
 | `layout.freertos_c` | 要插线程的 RTOS 文件 | `Core/Src/freertos.c` |
 | `layout.usart_c` / `usart_h` | 用来探测"工程是否已有串口"的文件 | `Core/Src/usart.c` / `Core/Inc/usart.h` |
-| `layout.uvprojx_glob` | Keil 工程文件的匹配模式 | `*.uvprojx` |
+| `layout.uvprojx_glob` | Keil 工程文件匹配模式 | `*.uvprojx` |
 | `layout.backup_dir` | 备份目录（相对 MDK-ARM） | `Unitree_GO_backup` |
-| `uvprojx.preferred_group` | 优先把文件登记进哪个组 | `bsp_upper` |
-| `uvprojx.fallback_group` | 组不存在时新建的组名 | `Unitree_GO` |
-| `uvprojx.include_entry` | 要补进 `IncludePath` 的路径 | `../bsp/uper` |
+| `uvprojx.preferred_group` / `fallback_group` | 文件登记进哪个组 / 组不存在时新建的组名 | `bsp_upper` / `Unitree_GO` |
+| `uvprojx.include_entry` | 补进 `IncludePath` 的路径 | `../bsp/uper` |
 | `freertos.blocks.*` | 4 个插入锚点（USER CODE 标记） | CubeMX 标准标记 |
 | `thread.name` / `stack_words` / `priority` | 生成线程的名字、栈（字）、优先级 | `UnitreeGO` / `512` / `osPriorityNormal` |
-| `defaults.*` | GUI / CLI 的默认值（通道、ID、周期、kp、kd、位置） | 见文件 |
-| `channel_map.*` | 每路 485 对应的串口、引脚、DE、AF | 见文件 |
+| `dma.irq_priority` | 生成的 DMA / 串口中断优先级 | `5` |
+| `dma.controller` / `fallback` | 优先用哪个 DMA 控制器 | `DMA1` / `DMA2` |
+| `callbacks.rx_event` / `error` | 工程里 HAL 回调的函数名（用于探测和插转发） | `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` |
+| `defaults.*` | GUI / CLI 默认值（通道、ID、周期、kp、kd、位置） | 见文件 |
+| `channel_map.*` | 每路 485 的串口、引脚、DE、AF、DMA 请求号 | 见文件 |
 | `marker` | 幂等标记，出现在所有插入片段里 | `UNITREE_GO_AUTOCONFIG` |
-
-> 换板子/换引脚时改 `channel_map` 即可，工具生成移植层时直接用这里的值。
 
 ---
 
-## 5. 生成的移植层（`Unitree_GO_port.c/.h`）
+## 5. 串口与 DMA 配置（重点）
 
-### 5.1 可调宏
+### 5.1 硬件通道
+
+DM-MC-Board02 板载两路高速 RS485（最高 10 Mbps，丝印 RS485-U2 / RS485-U3），GO-M8010-6 固定 **4 Mbps / 8 数据位 / 无校验 / 1 停止位**：
+
+| 通道 | 串口 | TX | RX | DE（方向脚） | DMA 请求（DMAMUX1） |
+|---|---|---|---|---|---|
+| 1 | USART2 | PD5 | PD6 | PD4 | `DMA_REQUEST_USART2_RX` = 43 |
+| 2 | USART3 | PD8 | PD9 | PB14 | `DMA_REQUEST_USART3_RX` = 45 |
+
+选通道：`Unitree_GO.h` 里的 `UNITREE_GO_485_CHANNEL`（1 或 2），工具会按 GUI/CLI 的选择写好。
+
+### 5.2 CubeMX 里怎么配
+
+**① 串口（Connectivity → USART2）**
+
+| 项 | 值 |
+|---|---|
+| Mode | Asynchronous |
+| Baud Rate | **4000000** |
+| Word Length | 8 Bits（无校验） |
+| Parity | None |
+| Stop Bits | 1 |
+| Oversampling | 16 |
+| 引脚 | PD5 = USART2_TX，PD6 = USART2_RX（CubeMX 自动配成 AF7，速度 High） |
+
+**② DMA（USART2 → DMA Settings → Add）**
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| DMA Request | **USART2_RX** | 只配接收；发送用阻塞 API |
+| Stream | 任选一个空闲流（CubeMX 默认 DMA1 Stream0/2/3…） | **不能和工程里别的外设撞车** |
+| Direction | Peripheral To Memory | 固定 |
+| Mode | **Normal** | 每帧结束后驱动会在回调里重新武装 |
+| Data Width | Peripheral = **Byte**，Memory = **Byte** | 串口是字节流 |
+| Increment Address | Memory ✔ / Peripheral ✘ | |
+| Priority | Low | 16 字节一帧，不急 |
+
+> 打开 **Circular** 也能用，但驱动每次 IDLE 后都会重新武装，Normal 更直观。
+
+**③ NVIC（USART2 → NVIC Settings）**
+
+| 中断 | 必须 | 原因 |
+|---|---|---|
+| **USART2 global interrupt** | ✔ | 空闲中断（IDLE）由串口中断上报，HAL 在中断里回调 `HAL_UARTEx_RxEventCallback` |
+| **DMA1 Stream3 global interrupt**（编号以你选的流为准） | ✔ | DMA 传输完成/错误中断 |
+| 优先级 | 与工程其它串口一致（CubeMX 默认 5） | 驱动不在中断里调用 FreeRTOS API，不受 `configMAX_SYSCALL_INTERRUPT_PRIORITY` 限制 |
+
+**④ 485 方向脚**
+
+PD4（通道 1）/ PB14（通道 2）由 `Unitree_GO_Init()` 初始化成推挽输出，**不需要在 CubeMX 里配**；如果你配了，设成 `GPIO_Output` 即可（驱动会重新初始化）。
+
+**⑤ 生成代码后**
+
+在 `stm32h7xx_it.c` 里 CubeMX 会自动生成 `USART2_IRQHandler()` 和 `DMA1_Stream3_IRQHandler()`，它们分别调用 `HAL_UART_IRQHandler(&huart2)` / `HAL_DMA_IRQHandler(&hdma_usart2_rx)`——驱动就靠这条链拿到 IDLE 事件。**不用改它们**。
+
+### 5.3 工具生成的等价代码（不用 CubeMX 时）
+
+工具在 `Unitree_GO_port.c` 里做了同样的事，可直接照抄：
+
+```c
+DMA_HandleTypeDef hdma_usart2_rx;
+
+static void UG_Port_DmaInit(void)
+{
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    hdma_usart2_rx.Instance                 = DMA1_Stream3;            /* 自动挑的空闲流 */
+    hdma_usart2_rx.Init.Request             = DMA_REQUEST_USART2_RX;
+    hdma_usart2_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_usart2_rx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart2_rx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.Mode                = DMA_NORMAL;
+    hdma_usart2_rx.Init.Priority            = DMA_PRIORITY_LOW;
+    hdma_usart2_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart2_rx) != HAL_OK) { Error_Handler(); }
+
+    __HAL_LINKDMA(&huart2, hdmarx, hdma_usart2_rx);   /* 必须在 StartRx 之前 */
+
+    HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
+}
+
+void USART2_IRQHandler(void)      { HAL_UART_IRQHandler(&huart2); }
+void DMA1_Stream3_IRQHandler(void){ HAL_DMA_IRQHandler(&hdma_usart2_rx); }
+```
+
+串口本身（4 Mbps 8N1 + PD5/PD6 AF7 + 空闲中断 NVIC）也一并生成：
+
+```c
+void HAL_UART_MspInit 等价的初始化在 UG_Port_UartInit() 里；
+huart2.Init.BaudRate = 4000000; ... HAL_UART_Init(&huart2);
+HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
+HAL_NVIC_EnableIRQ(USART2_IRQn);
+```
+
+> 工程里已有 USART2/DMA 时工具不会重复生成；已存在同名中断函数时也不会重复定义（否则会链接报重复符号）。
+
+### 5.4 回调接线（必须，工具自动做）
+
+`HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` 是**全局回调，所有串口共用**，所以驱动不占用它们，只要求转发一行。工程里已有这两个函数（本工程在 `app/usart_it.c`），工具会插入：
+
+```c
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    /* UNITREE_GO_AUTOCONFIG: rx: 宇树 GO 电机（DMA + 空闲中断）分发 */
+    Unitree_GO_RxEvent(huart, Size);      // 只认 GO 那一路，其它串口原样返回
+    ... 原来的 SBUS / 陀螺仪处理 ...
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    /* UNITREE_GO_AUTOCONFIG: err: 宇树 GO 电机（DMA + 空闲中断）分发 */
+    Unitree_GO_Error(huart);
+    ... 原来的处理 ...
+}
+```
+
+工程里**没有**这两个函数时，工具在 `Unitree_GO_port.c` 里直接定义（内容就是上面那两行）。
+
+### 5.5 一帧的完整时序（半双工）
+
+```
+任务： MITMode()  →  Send()
+         │
+         ├─ BuildFrame()：限幅 + 组 17 字节 + CRC
+         ├─ StopRx()：HAL_UART_AbortReceive()，发送期间关接收（防回波）
+         ├─ DE 拉高 → HAL_UART_Transmit(17B, 2ms) → DE 拉低
+         └─ StartRx()：HAL_UARTEx_ReceiveToIdle_DMA(buf, 32)
+                                   │
+电机：  收 17 字节（34 µs）→ 处理 → 回 16 字节
+                                   │
+总线空闲 1 个字符时间（≈2.5 µs）后 IDLE
+                                   ▼
+USART2_IRQHandler → HAL_UART_IRQHandler → HAL_UARTEx_RxEventCallback
+                                   │
+                     Unitree_GO_RxEvent(huart, size)
+                       ├─ 在 buf 里找 0xFD 0xEE（容忍残包/回波）
+                       ├─ 按帧里的 ID 找到对应句柄
+                       ├─ ParseData()：校验 CRC、换算成物理量、rx_seq++
+                       └─ StartRx()：重新武装 DMA，等下一帧
+
+任务： SendRecv 里 Poll() 看到 rx_seq 变化 → 返回 1
+```
+
+要点：
+
+- **发送不用 DMA**：17 字节 34 µs，阻塞发送反而能精确控制 DE 翻转时刻，半双工更可靠。
+- **接收是中断驱动**：任务里 `Send()` 之后不用轮询，`Poll()` 只是读一个计数器。
+- **每次 IDLE 后必须重新武装**：HAL 在 IDLE 时已结束本次 DMA 接收，驱动在回调里自动 `StartRx()`。
+- **半传输中断被关掉**：`__HAL_DMA_DISABLE_IT(hdmarx, DMA_IT_HT)`，16 字节的帧用不着 HT，少进一次中断。
+- **数据不对齐也能活**：DMA 缓冲里按帧头搜索，回波/残包只会被记进 `crc_err_cnt`。
+
+### 5.6 缓冲长度、兜底模式与注意事项
+
+| 项 | 说明 |
+|---|---|
+| `UNITREE_GO_RX_DMA_LEN` | DMA 缓冲长度（`Unitree_GO.h`，默认 **32**，必须 ≥ 16）。给 32 是为了容忍一帧之后紧跟的回波/残包 |
+| `UNITREE_GO_RX_WAIT_MS` | `SendRecv()` 等回包的最长时间（默认 **3 ms**） |
+| `UNITREE_GO_RX_USE_DMA` | 设 0 完全退回阻塞接收（不推荐，仅为兼容老工程） |
+| 没配 DMA 时 | `huart->hdmarx == NULL` → `rx_armed = 0` → `Poll()` 自动退回 `HAL_UART_Receive()` 阻塞接收。**不会"编译过但收不到"**，只是效率低 |
+| 一个串口多个电机 | 回包按帧里的 ID 自动分发到对应句柄；同一路总线只要有一个句柄的 DMA 武装着即可 |
+| 中断里做的事 | 找帧头 + 16 字节解析（含浮点换算），µs 级开销；不在中断里调用 FreeRTOS API |
+| 重复定义中断 | 若之后在 CubeMX 里也启用了这路串口/DMA，CubeMX 会在 `stm32h7xx_it.c` 再生成一份同名中断 → 把 `Unitree_GO_port.c` 里那两段删掉 |
+
+---
+
+## 6. 生成的移植层（`Unitree_GO_port.c/.h`）
+
+### 6.1 可调宏
 
 | 宏 | 默认 | 说明 |
 |---|---|---|
@@ -182,48 +354,34 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 | `UG_PORT_DEMO_KD` | 1.0 | 示例 kd（关节侧） |
 | `UG_PORT_SETTLE_MS` | 2000 | 上电先零力矩多久（手拨确认通信） |
 
-### 5.2 接口
+### 6.2 接口
 
 ```c
-void Unitree_GO_Port_Init(void);              // 幂等：初始化 485 + 电机句柄
+void Unitree_GO_Port_Init(void);              // 幂等：串口 + DMA + 电机句柄（Init 内部会 StartRx）
 void APP_Unitree_GO_Task(void *argument);     // 示例任务
 extern Unitree_GO_HandleTypeDef g_go_joint;   // 全局句柄，调试器直接 Watch
 ```
 
 示例任务流程：**零力矩 2 s**（手拨能轻松转 = 通信 + FOC 都正常）→ 收一帧 → 把当前位置记成关节 0 点 → **位置伺服到 `UG_PORT_DEMO_POS` 并保持**。
 
-> 默认会真的让电机转动。只想验证通信就把 `UG_PORT_DEMO_KP/KD` 改成 0（等价零力矩），或者用 `--no-task` 不生成任务、自己写控制循环。
+> 默认会真的让电机转动。只想验证通信就把 `UG_PORT_DEMO_KP/KD` 改成 0（等价零力矩），或用 `--no-task` 自己写控制循环。
 
 ---
 
-## 6. 驱动 API
+## 7. 驱动 API
 
-驱动所有接口在 `Unitree_GO.h`。句柄一个电机一个：
+句柄结构体（`Unitree_GO_HandleTypeDef`）分四组：硬件绑定（`huart/de_port/de_pin/de_active_high/id/ratio`）、下发指令（`mode/T/W/Pos/K_P/K_W/pos_offset`，转子侧）、反馈（`torque/speed/pos` 转子侧 + `joint_*` 关节侧、`temperature/error_code/foot_force`）、通讯状态（`correct/ok_cnt/timeout_cnt/crc_err_cnt/error_cnt/last_tick` + 接收侧 `rx_dma_buf/rx_armed/rx_size/rx_seq/rx_seen`）。
 
-```c
-typedef struct {
-    UART_HandleTypeDef *huart;      GPIO_TypeDef *de_port;   uint16_t de_pin;
-    uint8_t  id;                    float ratio;
-    uint8_t  mode;   float T, W, Pos, K_P, K_W, pos_offset;   // 指令（转子侧）
-    int8_t   temperature;  uint8_t error_code;  uint16_t foot_force;
-    float    torque, speed, pos;                              // 反馈（转子侧）
-    float    joint_torque, joint_speed, joint_pos;            // 反馈（关节侧）
-    uint8_t  correct;  uint32_t ok_cnt, timeout_cnt, crc_err_cnt, last_tick;
-    uint8_t  tx_buf[17], rx_buf[16];
-} Unitree_GO_HandleTypeDef;
-```
-
-### 6.1 初始化
+### 7.1 初始化
 
 ```c
 void Unitree_GO_Init(Unitree_GO_HandleTypeDef *motor, UART_HandleTypeDef *huart,
                      GPIO_TypeDef *de_port, uint16_t de_pin, uint8_t id, float ratio);
 ```
 
-绑定串口、DE 方向脚、ID、减速比；把 DE 脚配成推挽输出并切到接收方向。初始 `mode = 0`（锁定）。
-`id` 夹到 0~15；`ratio <= 0.01` 时回退 6.33。**不发起任何通讯**。
+绑定串口、DE 脚、ID、减速比；把 DE 配成推挽输出切到接收；登记进句柄表并**自动武装 DMA + 空闲中断接收**（`StartRx`）。`id` 夹到 0~15，`ratio <= 0.01` 回退 6.33。不发起通讯。
 
-### 6.2 模式
+### 7.2 模式
 
 ```c
 void Unitree_GO_SetMode(motor, mode);   // 0 锁定 / 1 FOC / 2 编码器标定
@@ -232,9 +390,9 @@ void Unitree_GO_Lock(motor);            // → 锁定
 void Unitree_GO_Calibrate(motor);       // → 标定（总线上只能挂一个电机）
 ```
 
-只改 `motor->mode`，**必须再 `SendRecv()`/`SendOnly()` 才生效**。
+只改 `motor->mode`，**必须再发一帧才生效**。
 
-### 6.3 控制（关节侧单位，自动切 FOC）
+### 7.3 控制（关节侧单位，自动切 FOC）
 
 | API | 说明 |
 |---|---|
@@ -243,31 +401,47 @@ void Unitree_GO_Calibrate(motor);       // → 标定（总线上只能挂一个
 | `Unitree_GO_SpeedMode(m, spd, kd)` | 只有速度阻尼（目标速度 0 = 阻尼模式） |
 | `Unitree_GO_TorqueMode(m, tq)` | 只给前馈力矩 |
 | `Unitree_GO_ZeroTorqueMode(m)` | 全 0 + FOC，可用手拖动 |
-| `Unitree_GO_MITModeRaw(m, pos, spd, kp, kd, tq)` | 转子侧原样下发，与手册表 1 一一对应，**不做减速比换算、不加零点** |
+| `Unitree_GO_MITModeRaw(m, pos, spd, kp, kd, tq)` | 转子侧原样下发，与手册表 1 一致，**不换算、不加零点** |
 
 内部换算：`Pos = 零点 + joint_pos × ratio`、`W = joint_speed × ratio`、`T = joint_torque / ratio`、`K_P/K_W = kp/kd ÷ gain_scale`。
 
-### 6.4 零点
+### 7.4 零点
 
 ```c
 void Unitree_GO_SetZeroPosition(motor);   // 把当前反馈位置记成关节 0 点
 ```
 
-写的是 RAM 里的 `pos_offset`，不下发、不写电机，掉电丢失；**必须在至少收到一帧有效反馈之后调用**，否则 `pos` 还是 0。
+写 RAM 里的 `pos_offset`，不下发、不写电机，掉电丢失；**必须在至少收到一帧有效反馈之后调用**。
 
-### 6.5 通讯
+### 7.5 通讯（DMA 版）
 
 | API | 说明 |
 |---|---|
-| `Unitree_GO_SendRecv(m)` | 组帧 → 切 DE 发送 → 收回包 → 校验解析；返回 1 = 成功 |
-| `Unitree_GO_SendOnly(m)` | 只发不收（广播 id=15、标定命令） |
-| `Unitree_GO_ParseData(m, buf)` | 解析 16 字节回包（改成 DMA/中断接收时在回调里调它） |
+| `Unitree_GO_Send(m)` | 组帧 → 关接收 → DE 发送 → 重新武装 DMA。返回 1 = 发送成功 |
+| `Unitree_GO_SendRecv(m)` | `Send()` + 最多等 `UNITREE_GO_RX_WAIT_MS`（3 ms）的 `Poll()` |
+| `Unitree_GO_SendOnly(m)` | 旧名字，等价 `Send()` |
+| `Unitree_GO_Poll(m)` | 有新的一帧有效反馈返回 1（DMA 模式不阻塞；无 DMA 时退回阻塞接收，最坏 1 ms） |
+| `Unitree_GO_StartRx(m)` / `Unitree_GO_StopRx(m)` | 武装 / 停止 DMA 接收（`Init` 已自动做，一般不手动调） |
+| `Unitree_GO_RxEvent(huart, size)` | 空闲中断分发入口，在 `HAL_UARTEx_RxEventCallback` 里转发 |
+| `Unitree_GO_Error(huart)` | 串口错误分发入口，在 `HAL_UART_ErrorCallback` 里转发 |
+| `Unitree_GO_ParseData(m, buf)` | 解析 16 字节回包（一般不用直接调） |
 | `Unitree_GO_IsOnline(m)` | 50 ms 内收到过有效帧返回 1 |
 | `Unitree_GO_Crc16(data, len)` | CRC16-CCITT（反射，init=0，poly 0x8408） |
 
-`SendRecv` 细节：广播 ID 直接返回不发等待；发送/接收超时分别 2 ms / 1 ms；接收前会再清一次 RX 缓冲，防止某些 485 芯片把自己发的包收回来。
+两种用法：
 
-### 6.6 单位与增益口径（最容易踩的坑）
+```c
+/* 同步：发完等回包（最常用） */
+Unitree_GO_MITMode(&go, 1.57f, 0.0f, 20.0f, 0.6f, 0.0f);
+if (Unitree_GO_SendRecv(&go)) { /* 这一轮成功，go.joint_pos 已更新 */ }
+
+/* 异步：发完先干别的，下一拍再取 */
+Unitree_GO_Send(&go);
+...
+if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
+```
+
+### 7.6 单位与增益口径
 
 `UNITREE_GO_GAIN_IN_JOINT_SPACE`（默认 1）：
 
@@ -280,7 +454,7 @@ void Unitree_GO_SetZeroPosition(motor);   // 把当前反馈位置记成关节 0
 
 ---
 
-## 7. 报文协议
+## 8. 报文协议
 
 小端；`T/W/Pos/K_P/K_W` 均为转子侧量（手册 8.2 节）。
 
@@ -314,43 +488,53 @@ void Unitree_GO_SetZeroPosition(motor);   // 把当前反馈位置记成关节 0
 
 ---
 
-## 8. 故障排查
+## 9. 故障排查
 
 | 现象 | 看什么 | 多半是 |
 |---|---|---|
-| 电机不动，`ok_cnt` 不涨 | `g_go_joint.timeout_cnt` | 485 通道选错、DE 极性（`UNITREE_GO_DE_ACTIVE_HIGH`）、A/B 接反、没共地、**ID 与 `UG_PORT_MOTOR_ID` 不一致**、没上电 |
+| 电机不动，`ok_cnt` 不涨 | `timeout_cnt` | 485 通道选错、DE 极性（`UNITREE_GO_DE_ACTIVE_HIGH`）、A/B 接反、没共地、**ID 与 `UG_PORT_MOTOR_ID` 不一致**、没上电 |
+| `SendRecv` 全超时 | `rx_armed` | DMA 没配上（`huart->hdmarx == NULL`）或 `StartRx` 失败；看 `error_cnt` |
+| `ok_cnt` 涨但 `SendRecv` 偶尔超时 | `UNITREE_GO_RX_WAIT_MS` | 控制周期太紧 / 总线忙；可把等待加到 5 ms |
 | 收得到但帧错 | `crc_err_cnt` | 波特率不是 4 Mbps、线太长/无终端电阻、DE 等待太短（加大 `UNITREE_GO_DE_SETTLE_LOOPS`） |
-| 收得到、`correct = 1`，却不动 | `joint_pos` 是否变化、换算后的 `K_P` 是否为 0 | kp/kd 口径、模式没进 FOC、供电不足 |
+| 完全收不到，`rx_size` 一直是 0 | 串口 IDLE 中断 | **NVIC 里没开 USARTx 全局中断**，或 `HAL_UARTEx_RxEventCallback` 没转发给 `Unitree_GO_RxEvent` |
+| `rx_size` 有值但 `crc_err_cnt` 涨 | 数据内容 | 帧头搜不到 → 波特率错 / A/B 反 / DE 极性反 |
+| Keil 链接报重复定义 `USART2_IRQHandler` | `stm32h7xx_it.c` | 后来在 CubeMX 里也启用了 USART2 → 删掉 `Unitree_GO_port.c` 里那段 |
+| Keil 编译报 `huart2 undefined` | 生成的 port 文件 | 工程已启用 USART2 但工具用了 installer 模式 → 重新运行工具 |
 | 电机猛甩 | — | kp 用了转子侧数值当关节侧，系数放大 40 倍 |
 | 回零位置不对 | `pos_offset` | 上电后没先收一帧就 `SetZeroPosition` |
-| Keil 编译报 `huart2 undefined` | 生成的 port 文件 | 工程已启用 USART2 但工具用了 installer 模式 → 重新运行工具（会检测并切复用模式） |
-| Keil 里看不到新文件 | `.uvprojx` | 关掉 Keil 重新打开工程（工具是在磁盘上改的工程文件） |
 
-调试顺序建议：**先确认通道/极性**（两路都试）→ `ZeroTorqueMode` 手拨能动 → 再上位置/速度环。
+调试顺序：**先确认通道/极性**（两路都试）→ `ZeroTorqueMode` 手拨能动 → 再上位置/速度环。
 
 ---
 
-## 9. FAQ
+## 10. FAQ
+
+**Q：为什么要 DMA + 空闲中断？**
+4 Mbps 下一帧回包 16 字节只要 32 µs，阻塞式 `HAL_UART_Receive` 会占着 CPU 轮询；IDLE 判帧尾是变长帧最省事的做法（宇树固定 16 字节，不用超时判断）。
 
 **Q：工具会破坏我的工程吗？**
-不会。所有改动前都备份；只插 CubeMX 的 `USER CODE` 区；`uvprojx` 改完会先做一次 XML 解析验证；重复运行是幂等的。
+不会。改动前备份；只插 CubeMX 的 `USER CODE` 区；回调里只插一行并带标记；`uvprojx` 改完先做 XML 校验；重复运行幂等。
 
 **Q：CubeMX 重新生成代码后要重跑吗？**
-不用。插入点都在 `USER CODE` 里，CubeMX 会保留；`bsp/uper/` 也不在生成范围。除非你把串口配置改了，那就重跑一次让移植层跟着更新。
+不用。插入点都在 `USER CODE` 里，CubeMX 会保留；`bsp/uper/` 不在生成范围。除非你**新开了** USART2/DMA，那就重跑一次让工具改走复用模式（并把重复的中断函数删掉）。
+
+**Q：我不在 CubeMX 里配 DMA，能跑吗？**
+能。驱动检测到 `hdmarx == NULL` 会自动退回阻塞接收（效率低）。但工具生成移植层时本来就会帮你把 DMA 配好。
 
 **Q：一个工程多个电机？**
-一个 `Unitree_GO_HandleTypeDef` 对应一个电机，按 ID 建多个句柄，**在同一个任务里顺序收发**（半双工总线不能并发发）。
+一个 `Unitree_GO_HandleTypeDef` 对应一个电机；同一路 485 上多个电机时，回包按 ID 自动分发，在同一个任务里按 ID 依次收发即可（半双工不能并发发）。
 
 **Q：电机 ID 怎么查/怎么改？**
 用宇树官方 MotorTools 的 `swboot`，出厂未设置时是 15（广播）。
 
 **Q：能用在别的板子吗？**
-可以。改 `config.json` 的 `channel_map`（串口、TX/RX、DE、AF），或用 `--channel 2`；驱动本身只依赖 HAL 的 UART/GPIO。
+可以。改 `config.json` 的 `channel_map`（串口、TX/RX、DE、AF、DMA 请求号），或用 `--channel 2`。
 
 ---
 
 ## 版本
 
-- **v1.0.0** — 驱动 + 一键配置工具首发：GUI/CLI、通道 1/2、复用/自建串口、CubeMX 安全插入、自动备份、幂等。
+- **v1.1.0** — 接收改为 **DMA + 空闲中断**：`StartRx/StopRx/Poll/Send/RxEvent/Error` 新 API，`SendRecv` 变成"发 + 等 3 ms"，半双工发送期间自动关接收；工具自动生成 DMA/中断/回调并支持复用工程已有配置。
+- **v1.0.0** — 驱动 + 一键配置工具首发（阻塞接收）。
 
-驱动来源：移植自 `R2_Code/Application/Unitree`（`gom_protocol.c/h` + `Unitree_control.c/h` + `crc_ccitt.c/h`），改为半双工板载 485 + 字节级组帧。
+驱动来源：移植自 `R2_Code/Application/Unitree`（`gom_protocol.c/h` + `Unitree_control.c/h` + `crc_ccitt.c/h`），改为半双工板载 485 + 字节级组帧 + DMA 空闲中断接收。

@@ -74,6 +74,44 @@
  * 万一实测收发方向相反，把这里改成 0 即可，不用改驱动代码 */
 #define UNITREE_GO_DE_ACTIVE_HIGH   1
 
+/*==============================================================================
+ * 三、接收方式：DMA + 空闲中断（默认）
+ *-------------------------------------------------------------------------------
+ * 为什么改 DMA：4 Mbps 下一帧回包 16 字节只需要 32 µs，阻塞式 HAL_UART_Receive
+ * 会占着 CPU 轮询；改成 DMA 搬运 + 空闲中断（IDLE）判帧尾，CPU 只在“一帧收完”
+ * 时进一次中断。
+ *
+ * 时序（半双工）：
+ *   发送前 StopRx() 关接收 -> DE 拉高发 17 字节 -> DE 拉低
+ *   -> StartRx() 重新武装 DMA -> 电机回包 -> 总线空闲 1 个字符时间后触发 IDLE
+ *   -> 工程里的 HAL_UARTEx_RxEventCallback() 转发给 Unitree_GO_RxEvent()
+ *   -> 驱动校验/换算，然后自动重新武装 DMA，等下一帧。
+ *
+ * 工程侧必须做两件事（一键配置工具会自动处理）：
+ *   1) 给这路串口配好 DMA 接收（USART2_RX / USART3_RX），并打开
+ *      DMAx_Streamy 与 USARTx 的 NVIC 中断；
+ *   2) 在工程已有的 HAL_UARTEx_RxEventCallback / HAL_UART_ErrorCallback 里
+ *      转发一行（多个串口共用这两个回调，所以是“转发”而不是“占用”）：
+ *
+ *          void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+ *          {
+ *              Unitree_GO_RxEvent(huart, Size);    // 只处理 GO 电机那一路
+ *              ... 其它串口的处理 ...
+ *          }
+ *          void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+ *          {
+ *              Unitree_GO_Error(huart);
+ *              ... 其它串口的处理 ...
+ *          }
+ *
+ * 没配 DMA 时会自动退回阻塞接收（Poll 里看 rx_armed），不会“编译过但收不到”；
+ * 但要用上 DMA 的效率，就必须把 DMA 配上。
+ *============================================================================*/
+#define UNITREE_GO_RX_USE_DMA       1u      /* 1 = DMA + 空闲中断（默认）  0 = 阻塞接收 */
+#define UNITREE_GO_RX_DMA_LEN       32u     /* DMA 接收缓冲长度，必须 >= 16；32 可容忍残包/回波 */
+#define UNITREE_GO_RX_WAIT_MS       3u      /* SendRecv() 等一帧回包的最长时间（ms） */
+#define UNITREE_GO_MAX_MOTORS       8u      /* 按 ID 分发用的句柄表容量 */
+
 /* K_P / K_W（刚度、阻尼）的换算口径，两种口径差 减速比²≈40 倍：
  *   1 = 关节侧（默认）：内部除以 ratio² 再下发。关节刚度 1 就是 1 N·m/rad，
  *       常用值 kp = 2~20、kd = 0.5~2。
@@ -84,7 +122,7 @@
 #define UNITREE_GO_GAIN_IN_JOINT_SPACE  1
 
 /*==============================================================================
- * 三、句柄
+ * 四、句柄
  *-------------------------------------------------------------------------------
  * 指令字段（mode/T/W/Pos/K_P/K_W）是"电机转子侧"，与协议、手册完全对应；
  * 反馈同时保留转子侧的 torque/speed/pos 和换算后的 joint_* 两套，
@@ -130,12 +168,20 @@ typedef struct
     uint32_t            crc_err_cnt;    // 帧头/CRC 错误次数
     uint32_t            last_tick;      // 最近一次收到有效帧的 tick
 
+    /* ---- 接收（DMA + 空闲中断） ---- */
+    uint8_t             rx_dma_buf[UNITREE_GO_RX_DMA_LEN]; // DMA 落地点（>= 16 字节）
+    volatile uint8_t    rx_armed;       // 1 = DMA 正在收
+    volatile uint16_t   rx_size;        // 最近一次空闲中断收到的字节数
+    volatile uint32_t   rx_seq;         // 每解析成功一帧 +1（Poll / SendRecv 用）
+    uint32_t            rx_seen;        // 应用侧已经消费到第几帧
+    uint32_t            error_cnt;      // DMA/UART 错误（ORE/FE/NE/PE）次数
+
     uint8_t             tx_buf[UNITREE_GO_TX_LEN];
     uint8_t             rx_buf[UNITREE_GO_RX_LEN];
 } Unitree_GO_HandleTypeDef;
 
 /*==============================================================================
- * 四、接口
+ * 五、接口
  *============================================================================*/
 void    Unitree_GO_Init(Unitree_GO_HandleTypeDef *motor,
                         UART_HandleTypeDef *huart,
@@ -168,9 +214,24 @@ void    Unitree_GO_SetZeroPosition(Unitree_GO_HandleTypeDef *motor);
 
 /* 通讯：发一帧命令并等一帧反馈，返回 1 表示这一轮收发+校验成功 */
 uint8_t Unitree_GO_SendRecv(Unitree_GO_HandleTypeDef *motor);
-/* 只发不收（广播、标定命令用），返回 1 表示发送成功 */
+
+/* 只发不收：组帧 + 发送（半双工：发送期间自动关接收，发完重新武装）。返回 1 = 发送成功 */
+uint8_t Unitree_GO_Send(Unitree_GO_HandleTypeDef *motor);
+/* 旧名字，等价于 Unitree_GO_Send()（广播、标定命令用） */
 uint8_t Unitree_GO_SendOnly(Unitree_GO_HandleTypeDef *motor);
-/* 解析一帧 16 字节反馈（如果以后改成 DMA/中断接收，在回调里调这个） */
+/* 有没有新的一帧有效反馈（DMA 模式不阻塞；没配 DMA 时退回阻塞接收，最坏 1 ms） */
+uint8_t Unitree_GO_Poll(Unitree_GO_HandleTypeDef *motor);
+
+/* 武装 / 停止 DMA 接收（Init 里已经自动 StartRx，一般不用手动调） */
+void    Unitree_GO_StartRx(Unitree_GO_HandleTypeDef *motor);
+void    Unitree_GO_StopRx(Unitree_GO_HandleTypeDef *motor);
+
+/* 空闲中断转发入口：在工程的 HAL_UARTEx_RxEventCallback 里调这个 */
+void    Unitree_GO_RxEvent(UART_HandleTypeDef *huart, uint16_t size);
+/* 串口错误转发入口：在工程的 HAL_UART_ErrorCallback 里调这个 */
+void    Unitree_GO_Error(UART_HandleTypeDef *huart);
+
+/* 解析一帧 16 字节反馈（一般不用直接调，DMA 回调里已经做了） */
 uint8_t Unitree_GO_ParseData(Unitree_GO_HandleTypeDef *motor, const uint8_t *data);
 
 uint8_t Unitree_GO_IsOnline(const Unitree_GO_HandleTypeDef *motor);
@@ -179,18 +240,26 @@ uint8_t Unitree_GO_IsOnline(const Unitree_GO_HandleTypeDef *motor);
 uint16_t Unitree_GO_Crc16(const uint8_t *data, uint16_t len);
 
 /*==============================================================================
- * 五、用法示例
+ * 六、用法示例
  *-------------------------------------------------------------------------------
- *  // main.c 里 usart.c 已经跑过 MX_USART2_UART_Init()（4Mbps 8N1），
+ *  // usart.c 里跑过 MX_USART2_UART_Init()（4Mbps 8N1）+ DMA 接收已配好，
  *  // 任务/初始化里只要建句柄（第 5 个参数是电机 ID，必须和电机里烧的一致！
  *  // 用宇树 MotorTools 的 swboot 可以看，出厂未设置时是 15，本项目当前那台是 1）：
  *  Unitree_GO_HandleTypeDef go_joint;
  *  Unitree_GO_Init(&go_joint, &UNITREE_GO_485_UART,
- *                  UNITREE_GO_DE_PORT, UNITREE_GO_DE_PIN, 1, 6.33f);
+ *                  UNITREE_GO_DE_PORT, UNITREE_GO_DE_PIN, 1, 6.33f);  // 内部会自动 StartRx
+ *
+ *  // 工程的 HAL_UARTEx_RxEventCallback / HAL_UART_ErrorCallback 里各加一行转发：
+ *  //   Unitree_GO_RxEvent(huart, Size);
+ *  //   Unitree_GO_Error(huart);
  *
  *  // 控制循环里（建议周期 >= 2ms，一轮收发 2 个电机约 0.6ms）：
  *  Unitree_GO_MITMode(&go_joint, 1.57f, 0.0f, 20.0f, 0.6f, 0.0f);  // 关节 1.57rad, kp=20, kd=0.6
- *  Unitree_GO_SendRecv(&go_joint);
+ *  Unitree_GO_SendRecv(&go_joint);        // = Send() + 最多等 3ms 的 Poll()
+ *
+ *  // 想完全不等（比如自己的状态机一帧一帧读）：
+ *  //   Unitree_GO_MITMode(...); Unitree_GO_Send(&go_joint);
+ *  //   if (Unitree_GO_Poll(&go_joint)) { 新反馈到了 }
  *
  *  // 注意 kp/kd 的口径：默认是"关节侧"刚度/阻尼（1 = 1 N·m/rad），常用 2~20；
  *  // 手册/R2 示例里 0.02~0.2 那种是转子侧系数，要么乘 40 再传，要么把
@@ -199,11 +268,13 @@ uint16_t Unitree_GO_Crc16(const uint8_t *data, uint16_t len);
  *
  *  // 同一路 485 上挂多个电机时，同一个任务里按 ID 依次 MITMode+SendRecv 即可，
  *  // 不要在两个任务里同时发（半双工总线，会互相踩包）。
+ *  // DMA 模式下回包按帧里的 ID 自动分发到对应句柄，多个句柄共用一路串口没问题，
+ *  // 只要这一路总线上至少有一个句柄的 DMA 是武装着的（Init 时自动做了）。
  *
  *  // 读结果：
  *  //   go_joint.joint_pos / joint_speed / joint_torque  关节侧反馈
  *  //   go_joint.temperature / error_code / correct      状态
- *  //   go_joint.timeout_cnt / crc_err_cnt               通讯质量
+ *  //   go_joint.timeout_cnt / crc_err_cnt / error_cnt   通讯质量
  *============================================================================*/
 
 #endif

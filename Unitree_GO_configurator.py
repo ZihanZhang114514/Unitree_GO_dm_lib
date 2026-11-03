@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LIB_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = LIB_DIR / "config.json"
 LAST_PATH_FILE = Path(tempfile.gettempdir()) / "unitree_go_configurator.json"
@@ -77,6 +77,11 @@ DEFAULT_CONFIG: dict = {
         "includes_block": ["/* USER CODE BEGIN Includes */", "/* USER CODE END Includes */"],
     },
     "thread": {"name": "UnitreeGO", "stack_words": 512, "priority": "osPriorityNormal"},
+    "dma": {"controller": "DMA1", "fallback": "DMA2", "irq_priority": 5},
+    "callbacks": {
+        "rx_event": "HAL_UARTEx_RxEventCallback",
+        "error": "HAL_UART_ErrorCallback",
+    },
     "defaults": {
         "channel": 1,
         "motor_id": 1,
@@ -90,12 +95,12 @@ DEFAULT_CONFIG: dict = {
         "1": {
             "uart_index": 2, "uart_name": "huart2", "instance": "USART2",
             "tx_pin": 5, "rx_pin": 6, "de_port": "GPIOD", "de_pin": 4,
-            "af": "GPIO_AF7_USART2",
+            "af": "GPIO_AF7_USART2", "dma_request": "DMA_REQUEST_USART2_RX",
         },
         "2": {
             "uart_index": 3, "uart_name": "huart3", "instance": "USART3",
             "tx_pin": 8, "rx_pin": 9, "de_port": "GPIOB", "de_pin": 14,
-            "af": "GPIO_AF7_USART3",
+            "af": "GPIO_AF7_USART3", "dma_request": "DMA_REQUEST_USART3_RX",
         },
     },
 }
@@ -170,6 +175,13 @@ class Scan:
     has_thread_patch: bool = False
     uart_owned_by: str = "installer"      # "project" | "installer"
     uart_reason: str = ""
+    dma_owned_by: str = "installer"       # "project" | "installer"
+    dma_stream: str = ""                  # 例如 DMA1_Stream3
+    dma_irq: str = ""                     # 例如 DMA1_Stream3_IRQn
+    dma_irq_defined: bool = False
+    usart_irq_defined: bool = False
+    cb_rx_file: Path | None = None        # 工程里已有 HAL_UARTEx_RxEventCallback 的文件
+    cb_err_file: Path | None = None
     other_user_files: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
@@ -230,6 +242,8 @@ class Installer:
             scan.has_thread_patch = MARKER in txt
 
         self._detect_uart(scan)
+        self._detect_dma(scan)
+        self._detect_callbacks(scan)
         self._detect_other_users(scan)
         if not scan.freertos:
             scan.warnings.append(
@@ -270,15 +284,89 @@ class Installer:
             scan.uart_owned_by = "installer"
             scan.uart_reason = f"工程里没有 {uart_name}，由移植层自己建 {inst}（4 Mbps）"
 
+    # ---- DMA / 回调检测 ----
+    def _port_paths(self, scan: Scan) -> set:
+        """本工具自己生成/管理的文件，扫描工程时要排除，否则会误判成“工程自带”。"""
+        lay = self.cfg["layout"]
+        p = lay["port_prefix"]
+        return {
+            (scan.driver_dir / "Unitree_GO.c").resolve(),
+            (scan.driver_dir / "Unitree_GO.h").resolve(),
+            (scan.driver_dir / f"{p}.c").resolve(),
+            (scan.driver_dir / f"{p}.h").resolve(),
+        }
+
+    def _project_sources(self, scan: Scan) -> list[Path]:
+        mine = self._port_paths(scan)
+        out: list[Path] = []
+        for sub in ("Core/Src", "app", "bsp"):
+            d = scan.root / sub
+            if d.is_dir():
+                for p in d.rglob("*.c"):
+                    if p.is_file() and p.resolve() not in mine:
+                        out.append(p)
+        return sorted(out)
+
+    def _detect_dma(self, scan: Scan) -> None:
+        """决定 DMA 用工程现成的，还是由移植层生成（自动挑一个空闲 stream）。"""
+        info = self.cfg["channel_map"][str(self.opts.channel)]
+        inst = info["instance"]
+        req = info.get("dma_request", "")
+
+        blob = ""
+        for p in self._project_sources(scan):
+            try:
+                blob += read_text(p) + "\n"
+            except Exception:
+                continue
+
+        used = set(re.findall(r"Instance\s*=\s*(DMA[12]_Stream\d+)", blob))
+        defined = set(re.findall(r"void\s+(DMA[12]_Stream\d+_IRQHandler)\s*\(", blob))
+        scan.usart_irq_defined = bool(re.search(rf"void\s+{inst}_IRQHandler\s*\(", blob))
+
+        m = re.search(rf"hdma_{inst.lower()}_rx\.Instance\s*=\s*(DMA[12]_Stream\d+)", blob)
+        if m and req in blob:
+            # 工程已经为这路串口配好了 DMA（CubeMX 生成的 hdma_usartx_rx）
+            scan.dma_owned_by = "project"
+            scan.dma_stream = m.group(1)
+            scan.dma_irq = f"{m.group(1)}_IRQn"
+            scan.dma_irq_defined = f"{m.group(1)}_IRQHandler" in defined
+        elif req in blob and "__HAL_LINKDMA" in blob:
+            scan.dma_owned_by = "project"
+            scan.dma_stream = ""
+            scan.dma_irq = ""
+            scan.dma_irq_defined = True
+        else:
+            scan.dma_owned_by = "installer"
+            cands = ([f"DMA1_Stream{i}" for i in range(8)] +
+                     [f"DMA2_Stream{i}" for i in range(8)])
+            free = [c for c in cands
+                    if c not in used and f"{c}_IRQHandler" not in defined]
+            if not free:
+                raise RuntimeError("工程里 16 个 DMA 流都被占用，没法给串口接收分配 DMA")
+            scan.dma_stream = free[0]
+            scan.dma_irq = f"{free[0]}_IRQn"
+            scan.dma_irq_defined = False
+
+    def _detect_callbacks(self, scan: Scan) -> None:
+        rx_name = self.cfg["callbacks"]["rx_event"]
+        err_name = self.cfg["callbacks"]["error"]
+        for p in self._project_sources(scan):
+            try:
+                txt = read_text(p)
+            except Exception:
+                continue
+            if scan.cb_rx_file is None and re.search(rf"void\s+{rx_name}\s*\(", txt):
+                scan.cb_rx_file = p
+            if scan.cb_err_file is None and re.search(rf"void\s+{err_name}\s*\(", txt):
+                scan.cb_err_file = p
+            if scan.cb_rx_file and scan.cb_err_file:
+                break
+
     def _detect_other_users(self, scan: Scan) -> None:
         """看看工程里是否已经有人用这个驱动（避免重复建任务抢总线）。"""
         lay = self.cfg["layout"]
-        mine = {
-            (scan.driver_dir / "Unitree_GO.c").resolve(),
-            (scan.driver_dir / "Unitree_GO.h").resolve(),
-            (scan.driver_dir / f"{lay['port_prefix']}.c").resolve(),
-            (scan.driver_dir / f"{lay['port_prefix']}.h").resolve(),
-        }
+        mine = self._port_paths(scan)
         hits = []
         for sub in ("app", "Core/Src", "Core/Inc", "bsp"):
             d = scan.root / sub
@@ -291,6 +379,10 @@ class Installer:
                     continue
                 if scan.freertos and p.resolve() == scan.freertos.resolve():
                     continue          # 这个文件是本工具自己打补丁的，不算“别人的接入代码”
+                if scan.cb_rx_file and p.resolve() == scan.cb_rx_file.resolve():
+                    continue          # HAL 回调文件里会插我们的转发，也不算
+                if scan.cb_err_file and p.resolve() == scan.cb_err_file.resolve():
+                    continue
                 try:
                     txt = read_text(p)
                 except Exception:
@@ -333,6 +425,12 @@ class Installer:
         self.log(f"Keil 工程   : {scan.uvprojx.name}")
         self.log(f"驱动目录    : {scan.driver_dir}")
         self.log(f"串口策略    : {scan.uart_reason}")
+        if scan.dma_owned_by == "project":
+            self.log(f"DMA 策略    : 复用工程自带" + (f"（{scan.dma_stream}）" if scan.dma_stream else ""))
+        else:
+            self.log(f"DMA 策略    : 生成（{scan.dma_stream} / {scan.dma_irq}，自动挑的空闲流）")
+        self.log("回调接线    : " + ("工程已有 HAL 回调 -> 插转发" if (scan.cb_rx_file or scan.cb_err_file)
+                                     else "工程没有 HAL 回调 -> 在移植层里定义"))
         for w in scan.warnings:
             self.log(f"[注意] {w}")
 
@@ -349,6 +447,7 @@ class Installer:
         # 2) 移植层
         if not skip_port:
             self._install_port(scan)
+            self._patch_callbacks(scan)
 
         # 3) freertos 线程
         if skip_port:
@@ -420,6 +519,7 @@ class Installer:
   * 生成时间 : {stamp}
   * 配置来源 : MDK-ARM/Unitree_GO_dm_lib/config.json
   * 485 通道 : {o.channel}（{info['instance']} {info['uart_name']}，DE={info['de_port']} pin{info['de_pin']}）
+  * DMA 接收 : {"工程自带" if scan.dma_owned_by == "project" else (scan.dma_stream or "移植层生成")}（空闲中断判帧尾）
   * 电机 ID  : {o.motor_id}    减速比 : {o.ratio}
   *
   * 想改参数：直接改下面几个宏；想重装：重新运行配置工具（会先备份）。
@@ -461,15 +561,63 @@ extern Unitree_GO_HandleTypeDef g_go_joint;
         rx_pin = info["rx_pin"]
         af = info["af"]
 
+        dma_req = info.get("dma_request", "")
+        stream = scan.dma_stream or "DMA1_Stream0"
+        dma_ctrl = stream.split("_")[0]
+        dma_irq = scan.dma_irq or f"{stream}_IRQn"
+        irq_prio = int(self.cfg["dma"]["irq_priority"])
+        dma_handle = f"hdma_{inst.lower()}_rx"
+        dma_installer = (scan.dma_owned_by == "installer")
+
+        dma_section = ""
+        if dma_installer:
+            dma_section = f"""/* ---- 接收 DMA（{dma_ctrl} / {dma_req}） ------------------------------
+ * 4 Mbps 下一帧回包只有 16 字节（32 µs），用 DMA 搬运 + 空闲中断判帧尾，
+ * CPU 不用在 HAL_UART_Receive 里轮询。
+ * CubeMX 里的等价配置：{inst} -> DMA Settings -> Add -> {inst}_RX，
+ *   Mode = Normal，Data Width = Byte/Byte，MemInc 使能，Priority = Low；
+ *   NVIC 里打开 {dma_irq} 全局中断（USART 的也要开）。 */
+DMA_HandleTypeDef {dma_handle};
+
+static void UG_Port_DmaInit(void)
+{{
+    __HAL_RCC_{dma_ctrl}_CLK_ENABLE();
+
+    {dma_handle}.Instance                 = {stream};
+    {dma_handle}.Init.Request             = {dma_req};
+    {dma_handle}.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    {dma_handle}.Init.PeriphInc           = DMA_PINC_DISABLE;
+    {dma_handle}.Init.MemInc              = DMA_MINC_ENABLE;
+    {dma_handle}.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    {dma_handle}.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    {dma_handle}.Init.Mode                = DMA_NORMAL;
+    {dma_handle}.Init.Priority            = DMA_PRIORITY_LOW;
+    {dma_handle}.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&{dma_handle}) != HAL_OK)
+    {{
+        Error_Handler();
+    }}
+
+    /* 串口 <-> DMA 绑定：必须在 Unitree_GO_StartRx() 之前完成 */
+    __HAL_LINKDMA(&{uart_name}, hdmarx, {dma_handle});
+
+    HAL_NVIC_SetPriority({dma_irq}, {irq_prio}, 0);
+    HAL_NVIC_EnableIRQ({dma_irq});
+}}
+"""
+
+        dma_call = "    UG_Port_DmaInit();\n" if dma_installer else ""
+
         if scan.uart_owned_by == "project":
             uart_section = f"""/* ---- 串口：复用工程里已有的 {uart_name}（{inst}）---------------------
  * 工程自己的 MX_{inst}_UART_Init() 负责引脚/时钟；这里只保证波特率是 4 Mbps。
+ * {"DMA 由本移植层补上（见上面的 UG_Port_DmaInit）。" if dma_installer else "DMA 工程里已经配好，直接用。"}
  * 如果工程还没调用过串口初始化，请在 main() 里调用 MX_{inst}_UART_Init()。 */
 extern UART_HandleTypeDef {uart_name};
 
 static void UG_Port_UartInit(void)
 {{
-    if (({uart_name}.Instance == {inst}) && ({uart_name}.Init.BaudRate != 4000000u))
+{dma_call}    if (({uart_name}.Instance == {inst}) && ({uart_name}.Init.BaudRate != 4000000u))
     {{
         {uart_name}.Init.BaudRate = 4000000u;
         if (HAL_UART_Init(&{uart_name}) != HAL_OK)
@@ -481,7 +629,8 @@ static void UG_Port_UartInit(void)
         else:
             uart_section = f"""/* ---- 串口：工程里没有 {uart_name}，这里自己建 {inst} ---------------
  * 引脚 {info['de_port'][-1]}{tx_pin}/{info['de_port'][-1]}{rx_pin} = {inst}_TX/RX，4 Mbps 8N1；
- * 485 方向脚 DE（{info['de_port']} pin{info['de_pin']}）由 Unitree_GO_Init() 负责。 */
+ * 485 方向脚 DE（{info['de_port']} pin{info['de_pin']}）由 Unitree_GO_Init() 负责。
+ * 接收走 DMA + 空闲中断，发送仍是阻塞（17 字节 34 µs，没必要上 DMA）。 */
 UART_HandleTypeDef {uart_name};
 
 static void UG_Port_UartInit(void)
@@ -489,7 +638,7 @@ static void UG_Port_UartInit(void)
     RCC_PeriphCLKInitTypeDef clk = {{0}};
     GPIO_InitTypeDef gpio = {{0}};
 
-    /* {inst} 内核时钟 = D2PCLK1（与 CubeMX 默认一致） */
+{dma_call}    /* {inst} 内核时钟 = D2PCLK1（与 CubeMX 默认一致） */
 
     clk.PeriphClockSelection = RCC_PERIPHCLK_{inst};
     clk.Usart234578ClockSelection = RCC_USART234578CLKSOURCE_D2PCLK1;
@@ -524,7 +673,48 @@ static void UG_Port_UartInit(void)
     {{
         Error_Handler();
     }}
+
+    /* 空闲中断（IDLE）靠串口全局中断，必须开 */
+    HAL_NVIC_SetPriority({inst}_IRQn, {irq_prio}, 0);
+    HAL_NVIC_EnableIRQ({inst}_IRQn);
 }}"""
+
+        # ---------------- 中断入口 / 回调 ----------------
+        irq_parts = []
+        if not scan.usart_irq_defined:
+            irq_parts.append(f"""void {inst}_IRQHandler(void)
+{{
+    HAL_UART_IRQHandler(&{uart_name});
+}}""")
+        if dma_installer and not scan.dma_irq_defined:
+            irq_parts.append(f"""void {stream}_IRQHandler(void)
+{{
+    HAL_DMA_IRQHandler(&{dma_handle});
+}}""")
+        irq_section = ""
+        if irq_parts:
+            irq_section = ("/* ---- 中断入口：工程里原来没有，这里补上 ----------------\n"
+                           " * 以后若在 CubeMX 里也开启了这路串口/这个 DMA 流，CubeMX 会在\n"
+                           " * stm32h7xx_it.c 里再生成一份同名函数 —— 那时把这里的两段删掉即可。 */\n"
+                           + "\n\n".join(irq_parts) + "\n")
+
+        cb_parts = []
+        cb_rx = self.cfg["callbacks"]["rx_event"]
+        cb_err = self.cfg["callbacks"]["error"]
+        if scan.cb_rx_file is None:
+            cb_parts.append(f"""void {cb_rx}(UART_HandleTypeDef *huart, uint16_t Size)
+{{
+    Unitree_GO_RxEvent(huart, Size);      /* 只认 GO 电机那一路，其它串口原样返回 */
+}}""")
+        if scan.cb_err_file is None:
+            cb_parts.append(f"""void {cb_err}(UART_HandleTypeDef *huart)
+{{
+    Unitree_GO_Error(huart);
+}}""")
+        callback_section = ""
+        if cb_parts:
+            callback_section = ("/* ---- HAL 回调：工程里没有，这里定义（空闲中断靠它分发） ---- */\n"
+                                + "\n\n".join(cb_parts) + "\n")
 
         rtos_include = '#include "cmsis_os.h"' if (self.opts.with_task and scan.freertos) else ""
         task_body = ""
@@ -583,6 +773,7 @@ void APP_Unitree_GO_Task(void *argument)
 
 Unitree_GO_HandleTypeDef g_go_joint;
 
+{dma_section}
 {uart_section}
 
 /* ---- 对外接口 -------------------------------------------------------- */
@@ -598,12 +789,15 @@ void Unitree_GO_Port_Init(void)
 
     UG_Port_UartInit();
 
-    /* DE 方向脚由驱动自己初始化；这里只做句柄绑定 */
+    /* DE 方向脚由驱动自己初始化；这里只做句柄绑定
+     * （Unitree_GO_Init 内部会自动武装 DMA + 空闲中断接收） */
     Unitree_GO_Init(&g_go_joint, &UNITREE_GO_485_UART,
                     UNITREE_GO_DE_PORT, UNITREE_GO_DE_PIN,
                     UG_PORT_MOTOR_ID, UG_PORT_RATIO);
 }}
 {task_body}
+{irq_section}
+{callback_section}
 """
         return head, src
 
@@ -613,6 +807,61 @@ void Unitree_GO_Port_Init(void)
         head, src = self._port_files(scan)
         self._put_file(scan.driver_dir / f"{prefix}.h", head, scan)
         self._put_file(scan.driver_dir / f"{prefix}.c", src, scan)
+
+    def _patch_callbacks(self, scan: Scan) -> None:
+        """工程里已有 HAL_UARTEx_RxEventCallback / HAL_UART_ErrorCallback 时，
+        往里面插一行转发（DMA 空闲中断靠它把帧交给驱动）。"""
+        pairs = []
+        if scan.cb_rx_file is not None:
+            pairs.append((scan.cb_rx_file, self.cfg["callbacks"]["rx_event"],
+                          "Unitree_GO_RxEvent(huart, Size);", "rx"))
+        if scan.cb_err_file is not None:
+            pairs.append((scan.cb_err_file, self.cfg["callbacks"]["error"],
+                          "Unitree_GO_Error(huart);", "err"))
+
+        for path, fname, call, tag in pairs:
+            rel = path.relative_to(scan.root)
+            text = read_text(path)
+            marker = f"{MARKER}: {tag}"
+            if marker in text:
+                self.log(f"[不变] {rel}（{fname} 已转发）")
+                self.changes.append(("unchanged", str(rel), None))
+                continue
+            if self.opts.dry_run:
+                self.log(f"[将修改] {rel}（在 {fname} 里插一行转发）")
+                self.changes.append(("would-patch", str(rel), None))
+                continue
+
+            m = re.search(rf"void\s+{fname}\s*\([^)]*\)\s*\{{", text)
+            if not m:
+                self.log(f"[跳过] 找不到 {fname} 的函数体：{rel}")
+                continue
+
+            nl = nl_of(text)
+            snippet = (f"{nl}    /* {marker}: 宇树 GO 电机（DMA + 空闲中断）分发 */"
+                       f"{nl}    {call}")
+            new_text = text[:m.end()] + snippet + text[m.end():]
+            new_text = self._ensure_include(new_text, '#include "Unitree_GO_port.h"')
+
+            bak = self._backup(path)
+            write_text(path, new_text)
+            self.log(f"[修改] {rel}（{fname} 里插一行转发）")
+            self.changes.append(("patched", str(rel), bak))
+
+    @staticmethod
+    def _ensure_include(text: str, include_line: str) -> str:
+        if include_line in text:
+            return text
+        nl = nl_of(text)
+        lines = text.split(nl)
+        last = -1
+        for i, line in enumerate(lines[:200]):
+            if line.strip().startswith("#include"):
+                last = i
+        if last < 0:
+            return text
+        lines.insert(last + 1, include_line)
+        return nl.join(lines)
 
     # ---- 3) freertos.c ----
     def _patch_freertos(self, scan: Scan) -> None:
@@ -797,6 +1046,8 @@ const osThreadAttr_t unitree_go_attributes = {{
             f"Keil 工程  : {scan.uvprojx}",
             f"驱动目录   : {scan.driver_dir}",
             f"485 通道   : {self.opts.channel}  ({scan.uart_reason})",
+            f"DMA        : {'复用工程自带' if scan.dma_owned_by == 'project' else '移植层生成'} "
+            f"{scan.dma_stream or '-'} / {scan.dma_irq or '-'}",
             f"电机 ID    : {self.opts.motor_id}   减速比 {self.opts.ratio}",
             f"示例任务   : {'生成' if (self.opts.with_task and scan.freertos and not scan.other_user_files) else '未生成'}",
             "",
