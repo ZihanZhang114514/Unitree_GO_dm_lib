@@ -372,7 +372,77 @@ extern Unitree_GO_HandleTypeDef g_go_joint;   // 全局句柄，调试器直接 
 
 句柄结构体（`Unitree_GO_HandleTypeDef`）分四组：硬件绑定（`huart/de_port/de_pin/de_active_high/id/ratio`）、下发指令（`mode/T/W/Pos/K_P/K_W/pos_offset`，转子侧）、反馈（`torque/speed/pos` 转子侧 + `joint_*` 关节侧、`temperature/error_code/foot_force`）、通讯状态（`correct/ok_cnt/timeout_cnt/crc_err_cnt/error_cnt/last_tick` + 接收侧 `rx_dma_buf/rx_armed/rx_size/rx_seq/rx_seen`）。
 
-### 7.1 初始化
+下面 7.1 先讲**每个字段归谁写**（这是最容易困惑的地方），7.2 起才是 API。
+
+### 7.1 句柄字段由谁赋值
+
+**一句话：你不用手填结构体。** 你只给 `Unitree_GO_Init()` 6 个参数，其余字段由"初始化 / 控制函数 / 协议层"三处在合适的时机写入。
+
+#### ① 配置字段 —— 只有你写（通过 `Init` 参数，一次性）
+
+| 字段 | 谁写 | 时机 | 备注 |
+|---|---|---|---|
+| `huart` | 你（`Init` 第 2 个参数） | 初始化一次 | `&huart2` / `&huart3`；**要求该串口已经 `HAL_UART_Init` 过** |
+| `de_port` / `de_pin` | 你（`Init` 第 3、4 个参数） | 一次 | 驱动会把它配成推挽输出 |
+| `de_active_high` | `Init` 取宏 `UNITREE_GO_DE_ACTIVE_HIGH`；**运行时可改** | 现场试极性 | 1 = 高电平发送 |
+| `id` | 你（`Init` 第 5 个参数） | 一次 | 大于 15 会被夹到 15（广播） |
+| `ratio` | 你（`Init` 第 6 个参数） | 一次 | `<= 0.01` 回退 6.33 |
+
+#### ② 初始化时自动清零 —— `Unitree_GO_Init()` 写
+
+| 字段 | 写入值 |
+|---|---|
+| `mode` | `0`（LOCK，上电先锁定） |
+| `T` `W` `Pos` `K_P` `K_W` | 全 `0` |
+| `pos_offset` | `0` |
+| `temperature` `error_code` `foot_force` `torque` `speed` `pos` `joint_torque` `joint_speed` `joint_pos` | 全 `0` |
+| `correct` `ok_cnt` `timeout_cnt` `crc_err_cnt` `error_cnt` `last_tick` | 全 `0` |
+| `rx_armed` `rx_size` `rx_seq` `rx_seen` | 全 `0` |
+| `tx_buf` `rx_buf` `rx_dma_buf` | `memset` 清空 |
+
+> 全局句柄在 `.bss` 里本来就是 0，所以"没写初始化列表"是正常的；但**不能因此跳过 `Init`** —— `huart = NULL` 时 `Send()` 直接返回 0。
+
+#### ③ 指令字段 —— 控制函数每轮写
+
+| 字段 | `MITMode` | `PositionMode` | `SpeedMode` | `TorqueMode` | `ZeroTorqueMode` | `MITModeRaw` |
+|---|---|---|---|---|---|---|
+| `mode` | FOC(1) | FOC(1) | FOC(1) | FOC(1) | FOC(1) | FOC(1) |
+| `Pos` | `pos_offset + joint_pos×ratio` | 同 `MITMode` | `pos_offset` | `pos_offset` | `pos_offset` | 原样 |
+| `W` | `joint_speed×ratio` | 0 | `joint_speed×ratio` | 0 | 0 | 原样 |
+| `T` | `joint_torque/ratio` | 0 | 0 | `joint_torque/ratio` | 0 | 原样 |
+| `K_P` | `kp/gain_scale` | 同 `MITMode` | 0 | 0 | 0 | 原样 |
+| `K_W` | `kd/gain_scale` | 同 `MITMode` | `kd/gain_scale` | 0 | 0 | 原样 |
+
+`gain_scale` 见 [7.7](#77-单位与增益口径)。另外 `SetMode/Enable/Lock/Calibrate` 只写 `mode`；`SetZeroPosition` 写 `pos_offset` 和 `joint_pos`。
+
+#### ④ 协议层写 —— `Send()` / 中断回调里
+
+| 字段 | 谁写 | 什么时候 |
+|---|---|---|
+| `tx_buf`（17 字节帧）+ `T/W/Pos/K_P/K_W/mode` 的**限幅回写** | `BuildFrame()`（`Send()` 内部） | 每发一帧 |
+| `torque` `speed` `pos` `joint_torque` `joint_speed` `joint_pos` `temperature` `error_code` `foot_force` | `ParseData()` | 每收到一帧有效回包（DMA 空闲中断里） |
+| `correct` `ok_cnt` `last_tick` `rx_seq` | `ParseData()` 成功时 | 同上 |
+| `crc_err_cnt` | `ParseData()` 帧头/CRC 错时；`RxEvent()` 收到数据但找不到 `0xFD 0xEE` 时 | 解析失败 |
+| `error_cnt` | `StartRx()` 武装失败、`Unitree_GO_Error()` | 通讯异常 |
+| `rx_size` | `RxEvent()` | 每次空闲中断 |
+| `rx_armed` | `StartRx()` / `StopRx()` | 收发前后 |
+| `rx_seen` | `Send()`（发送前对齐）、`Poll()`（消费新帧） | 收发过程中 |
+
+#### ⑤ 你"可以"改、但通常不必改的
+
+| 字段 | 用法 |
+|---|---|
+| `pos_offset` | 想手动定零点时可以直写；正常用 `SetZeroPosition()` |
+| `de_active_high` | 现场发现收发方向反了，运行时翻转再试，不用重编译 |
+| `T/W/Pos/K_P/K_W` | 想绕过换算直接下发原始量时才手写，之后 `Send()`（会被限幅写回；下一轮控制函数又会覆盖） |
+
+#### 三条注意事项
+
+1. **反馈字段是只读的**：`torque/speed/pos/joint_*/temperature/...` 你写了也会被下一帧覆盖。
+2. **顺序不能反**：`MX_USARTx_UART_Init()` → `Unitree_GO_Init()` → 循环里 `控制函数 + Send/SendRecv`。
+3. **别混用两种风格**：每轮调 `MITMode`（等）和手写 `T/W/Pos` 二选一，混用会互相覆盖。
+
+### 7.2 初始化
 
 ```c
 void Unitree_GO_Init(Unitree_GO_HandleTypeDef *motor, UART_HandleTypeDef *huart,
@@ -381,7 +451,7 @@ void Unitree_GO_Init(Unitree_GO_HandleTypeDef *motor, UART_HandleTypeDef *huart,
 
 绑定串口、DE 脚、ID、减速比；把 DE 配成推挽输出切到接收；登记进句柄表并**自动武装 DMA + 空闲中断接收**（`StartRx`）。`id` 夹到 0~15，`ratio <= 0.01` 回退 6.33。不发起通讯。
 
-### 7.2 模式
+### 7.3 模式
 
 ```c
 void Unitree_GO_SetMode(motor, mode);   // 0 锁定 / 1 FOC / 2 编码器标定
@@ -392,7 +462,7 @@ void Unitree_GO_Calibrate(motor);       // → 标定（总线上只能挂一个
 
 只改 `motor->mode`，**必须再发一帧才生效**。
 
-### 7.3 控制（关节侧单位，自动切 FOC）
+### 7.4 控制（关节侧单位，自动切 FOC）
 
 | API | 说明 |
 |---|---|
@@ -405,7 +475,7 @@ void Unitree_GO_Calibrate(motor);       // → 标定（总线上只能挂一个
 
 内部换算：`Pos = 零点 + joint_pos × ratio`、`W = joint_speed × ratio`、`T = joint_torque / ratio`、`K_P/K_W = kp/kd ÷ gain_scale`。
 
-### 7.4 零点
+### 7.5 零点
 
 ```c
 void Unitree_GO_SetZeroPosition(motor);   // 把当前反馈位置记成关节 0 点
@@ -413,7 +483,7 @@ void Unitree_GO_SetZeroPosition(motor);   // 把当前反馈位置记成关节 0
 
 写 RAM 里的 `pos_offset`，不下发、不写电机，掉电丢失；**必须在至少收到一帧有效反馈之后调用**。
 
-### 7.5 通讯（DMA 版）
+### 7.6 通讯（DMA 版）
 
 | API | 说明 |
 |---|---|
@@ -441,7 +511,7 @@ Unitree_GO_Send(&go);
 if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 ```
 
-### 7.6 单位与增益口径
+### 7.7 单位与增益口径
 
 `UNITREE_GO_GAIN_IN_JOINT_SPACE`（默认 1）：
 
