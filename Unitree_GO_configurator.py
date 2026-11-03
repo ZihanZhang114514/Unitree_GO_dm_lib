@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 LIB_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = LIB_DIR / "config.json"
 LAST_PATH_FILE = Path(tempfile.gettempdir()) / "unitree_go_configurator.json"
@@ -192,6 +192,7 @@ class Scan:
     cb_rx_file: Path | None = None        # 工程里已有 HAL_UARTEx_RxEventCallback 的文件
     cb_err_file: Path | None = None
     other_user_files: list = field(default_factory=list)
+    manual_refs: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
 
@@ -399,10 +400,19 @@ class Installer:
                 break
 
     def _detect_other_users(self, scan: Scan) -> None:
-        """看看工程里是否已经有人用这个驱动（避免重复建任务抢总线）。"""
-        lay = self.cfg["layout"]
+        """看看工程里是否已经有人用这个驱动（避免重复建任务抢总线）。
+
+        分两类：
+          * 别人的接入代码（app/、bsp/ 里的）→ 不再自动加线程；
+          * main.c / freertos.c 里手写的接入代码 → 只提示（多半是照 README 抄的样例，
+            和移植层的 App_Init/App_Step 重复，建议删掉）。
+        """
         mine = self._port_paths(scan)
-        hits = []
+        # 本工具自己插入的符号，判断“是不是用户手写”时要先摘掉
+        own = ("Unitree_GO_port.h", "Unitree_GO_App_Init", "Unitree_GO_App_Step",
+               "APP_Unitree_GO_Task", "unitree_go_attributes",
+               "Unitree_GO_RxEvent", "Unitree_GO_Error")
+        hits, manual = [], []
         for sub in ("app", "Core/Src", "Core/Inc", "bsp"):
             d = scan.root / sub
             if not d.is_dir():
@@ -412,29 +422,32 @@ class Installer:
                     continue
                 if p.resolve() in mine:
                     continue
-                if scan.freertos and p.resolve() == scan.freertos.resolve():
-                    continue          # 这个文件是本工具自己打补丁的，不算“别人的接入代码”
-                if scan.main_c and p.resolve() == scan.main_c.resolve():
-                    continue          # 裸机工程：main.c 里会插我们的 App_Init/App_Step
-                if scan.cb_rx_file and p.resolve() == scan.cb_rx_file.resolve():
-                    continue          # HAL 回调文件里会插我们的转发，也不算
-                if scan.cb_err_file and p.resolve() == scan.cb_err_file.resolve():
-                    continue
                 try:
                     txt = read_text(p)
                 except Exception:
                     continue
-                # 去掉注释再判断，避免“注释里提了一句 Unitree_GO_Init()”被误报
                 txt = re.sub(r"/\*.*?\*/", " ", txt, flags=re.S)
                 txt = re.sub(r"//[^\n]*", " ", txt)
-                if ("Unitree_GO_" in txt or "APP_Unitree_test" in txt or
-                        "g_go_joint" in txt):
-                    hits.append(str(p.relative_to(scan.root)))
+                for name in own:
+                    txt = txt.replace(name, " ")
+                if not re.search(r"Unitree_GO_\w+|\bg_go_joint\b|APP_Unitree_test", txt):
+                    continue
+                rel = str(p.relative_to(scan.root))
+                is_patched = ((scan.freertos and p.resolve() == scan.freertos.resolve()) or
+                              (scan.main_c and p.resolve() == scan.main_c.resolve()))
+                (manual if is_patched else hits).append(rel)
+
         scan.other_user_files = hits
+        scan.manual_refs = manual
         if hits and not scan.has_thread_patch:
             scan.warnings.append(
                 "工程里已经存在别的宇树 GO 代码：" + "，".join(hits[:5]) +
                 "；为避免两个任务抢同一路 485，本次不会自动加线程，请自行决定是否删掉旧的接入代码")
+        if manual:
+            scan.warnings.append(
+                "这些文件里有手写的 Unitree_GO 接入代码：" + "，".join(manual[:5]) +
+                "（例如 motor_init()/go_joint）。它和移植层的 App_Init/App_Step 重复，"
+                "建议删掉手写那份，否则两个句柄会抢同一路 485")
 
     # ---------------- 备份 ----------------
     def _backup(self, path: Path) -> Path | None:
@@ -658,13 +671,19 @@ static void UG_Port_DmaInit(void)
 
         dma_call = "    UG_Port_DmaInit();\n" if dma_installer else ""
 
+        # 串口句柄必须先声明：UG_Port_DmaInit() 里有 __HAL_LINKDMA(&huartX, ...)
+        if scan.uart_owned_by == "project":
+            uart_decl = f"""/* 复用工程已有的 {inst} 句柄（定义在 usart.c 或 main.c 里） */
+extern UART_HandleTypeDef {uart_name};"""
+        else:
+            uart_decl = f"""/* 工程里没有 {inst}，由移植层自己定义 */
+UART_HandleTypeDef {uart_name};"""
+
         if scan.uart_owned_by == "project":
             uart_section = f"""/* ---- 串口：复用工程里已有的 {uart_name}（{inst}）---------------------
  * 工程自己的 MX_{inst}_UART_Init() 负责引脚/时钟；这里只保证波特率是 4 Mbps。
  * {"DMA 由本移植层补上（见上面的 UG_Port_DmaInit）。" if dma_installer else "DMA 工程里已经配好，直接用。"}
  * 如果工程还没调用过串口初始化，请在 main() 里调用 MX_{inst}_UART_Init()。 */
-extern UART_HandleTypeDef {uart_name};
-
 static void UG_Port_UartInit(void)
 {{
 {dma_call}    if (({uart_name}.Instance == {inst}) && ({uart_name}.Init.BaudRate != 4000000u))
@@ -685,8 +704,6 @@ static void UG_Port_UartInit(void)
  * 引脚 {info['de_port'][-1]}{tx_pin}/{info['de_port'][-1]}{rx_pin} = {inst}_TX/RX，4 Mbps 8N1；
  * 485 方向脚 DE（{info['de_port']} pin{info['de_pin']}）由 Unitree_GO_Init() 负责。
  * 接收走 DMA + 空闲中断，发送仍是阻塞（17 字节 34 µs，没必要上 DMA）。 */
-UART_HandleTypeDef {uart_name};
-
 static void UG_Port_UartInit(void)
 {{
     RCC_PeriphCLKInitTypeDef clk = {{0}};
@@ -722,7 +739,8 @@ static void UG_Port_UartInit(void)
     {uart_name}.Init.OverSampling = UART_OVERSAMPLING_16;
     {uart_name}.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
     {uart_name}.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-    {uart_name}.Init.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+    /* 不写 AdvancedInit：不同 HAL 版本它一个在 Init 里、一个在句柄顶层。
+     * 句柄是全局变量（.bss 清零），等价于 UART_ADVFEATURE_NO_INIT，不用管。 */
     if (HAL_UART_Init(&{uart_name}) != HAL_OK)
     {{
         Error_Handler();
@@ -851,6 +869,9 @@ void APP_Unitree_GO_Task(void *argument)
 {rtos_include}
 
 Unitree_GO_HandleTypeDef g_go_joint;
+
+/* ---- 串口句柄（必须声明在 DmaInit / UartInit 之前） ---- */
+{uart_decl}
 
 {dma_section}
 {uart_section}

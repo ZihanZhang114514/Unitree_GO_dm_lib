@@ -650,6 +650,10 @@ if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 
 ## 版本
 
+- **v1.1.2** — 修生成的 `Unitree_GO_port.c` 的两个编译问题（已在 Keil AC5 + 该工程 HAL 上实编验证）：
+  ① `__HAL_LINKDMA(&huartx, ...)` 出现在句柄声明之前 → `error #20: identifier "huart3" is undefined`；
+  ② `huart->Init.AdvancedInit` 只在新版 HAL 存在（老版是句柄顶层成员）→ `error #136: has no field "AdvancedInit"`，改为不写（全局句柄清零即等价 NO_INIT）。
+  另加：`main.c`/`freertos.c` 里手写的 GO 接入代码（如 `motor_init()`）会被识别并提示，避免和移植层重复。
 - **v1.1.1** — 修 3 个实测问题：① GUI 的 `_options` 与 tkinter 内部方法重名（点「完成」弹窗报 TypeError）；② 驱动不再 include `usart.h`（否则"串口初始化生成在 main.c、没有 usart.h"的工程直接编译失败）；③ 裸机工程现在会自动生成 `App_Init/App_Step` 并插进 `main.c`。另加：复用工程现有串口时补 NVIC 使能、自动识别 main.c 里的串口定义、提示另一路已在跑 4 Mbps 的串口。
 - **v1.1.0** — 接收改为 **DMA + 空闲中断**：`StartRx/StopRx/Poll/Send/RxEvent/Error` 新 API，`SendRecv` 变成"发 + 等 3 ms"，半双工发送期间自动关接收；工具自动生成 DMA/中断/回调并支持复用工程已有配置。
 - **v1.0.0** — 驱动 + 一键配置工具首发（阻塞接收）。
