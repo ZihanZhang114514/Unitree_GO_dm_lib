@@ -1,0 +1,78 @@
+{
+  "lib": {
+    "name": "Unitree_GO",
+    "version": "1.0.0",
+    "description": "宇树 GO-M8010-6 关节电机驱动（半双工 RS485）+ Keil 工程一键配置工具",
+    "driver_files": ["Unitree_GO.c", "Unitree_GO.h"]
+  },
+
+  "layout": {
+    "driver_dir": "bsp/uper",
+    "port_prefix": "Unitree_GO_port",
+    "freertos_c": "Core/Src/freertos.c",
+    "core_src": "Core/Src",
+    "usart_c": "Core/Src/usart.c",
+    "usart_h": "Core/Inc/usart.h",
+    "uvprojx_glob": "*.uvprojx",
+    "backup_dir": "Unitree_GO_backup"
+  },
+
+  "uvprojx": {
+    "preferred_group": "bsp_upper",
+    "fallback_group": "Unitree_GO",
+    "include_entry": "../bsp/uper",
+    "file_type_c": 1
+  },
+
+  "freertos": {
+    "blocks": {
+      "prototypes": ["/* USER CODE BEGIN FunctionPrototypes */", "/* USER CODE END FunctionPrototypes */"],
+      "variables": ["/* USER CODE BEGIN Variables */", "/* USER CODE END Variables */"],
+      "threads": ["/* USER CODE BEGIN RTOS_THREADS */", "/* USER CODE END RTOS_THREADS */"]
+    },
+    "include_line": "#include \"Unitree_GO_port.h\"",
+    "includes_block": ["/* USER CODE BEGIN Includes */", "/* USER CODE END Includes */"]
+  },
+
+  "thread": {
+    "name": "UnitreeGO",
+    "stack_words": 512,
+    "priority": "osPriorityNormal"
+  },
+
+  "defaults": {
+    "channel": 1,
+    "motor_id": 1,
+    "ratio": 6.33,
+    "period_ms": 10,
+    "demo_pos": 0.5,
+    "demo_kp": 4.0,
+    "demo_kd": 1.0
+  },
+
+  "channel_map": {
+    "1": {
+      "uart_index": 2,
+      "uart_name": "huart2",
+      "instance": "USART2",
+      "tx_pin": 5,
+      "rx_pin": 6,
+      "de_port": "GPIOD",
+      "de_pin": 4,
+      "af": "GPIO_AF7_USART2"
+    },
+    "2": {
+      "uart_index": 3,
+      "uart_name": "huart3",
+      "instance": "USART3",
+      "tx_pin": 8,
+      "rx_pin": 9,
+      "de_port": "GPIOB",
+      "de_pin": 14,
+      "af": "GPIO_AF7_USART3"
+    }
+  },
+
+  "marker": "UNITREE_GO_AUTOCONFIG",
+  "generated_files": ["Unitree_GO_port.c", "Unitree_GO_port.h"]
+}
