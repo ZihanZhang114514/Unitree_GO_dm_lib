@@ -2,7 +2,9 @@
 #define UNITREE_GO_H
 
 #include "main.h"
-#include "usart.h"
+/* 故意不 include "usart.h"：CubeMX 也可以把串口初始化全生成在 main.c 里（没有 usart.h），
+ * 那时依赖 usart.h 会直接编译报"找不到头文件"。UART_HandleTypeDef 由 main.h 提供，
+ * huart2/huart3 的声明要么来自工程的 usart.h，要么来自移植层 Unitree_GO_port.c。 */
 
 /*==============================================================================
  * 宇树 GO-M8010-6 关节电机驱动（RS485 半双工，单文件封装）

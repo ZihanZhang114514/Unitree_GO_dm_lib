@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 LIB_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = LIB_DIR / "config.json"
 LAST_PATH_FILE = Path(tempfile.gettempdir()) / "unitree_go_configurator.json"
@@ -77,6 +77,14 @@ DEFAULT_CONFIG: dict = {
         "includes_block": ["/* USER CODE BEGIN Includes */", "/* USER CODE END Includes */"],
     },
     "thread": {"name": "UnitreeGO", "stack_words": 512, "priority": "osPriorityNormal"},
+    "main": {
+        "file": "Core/Src/main.c",
+        "blocks": {
+            "includes": ["/* USER CODE BEGIN Includes */", "/* USER CODE END Includes */"],
+            "init": ["/* USER CODE BEGIN 2 */", "/* USER CODE END 2 */"],
+            "loop": ["/* USER CODE BEGIN 3 */", "/* USER CODE END 3 */"],
+        },
+    },
     "dma": {"controller": "DMA1", "fallback": "DMA2", "irq_priority": 5},
     "callbacks": {
         "rx_event": "HAL_UARTEx_RxEventCallback",
@@ -170,6 +178,7 @@ class Scan:
     freertos: Path | None
     usart_c: Path | None
     usart_h: Path | None
+    main_c: Path | None = None
     has_driver: bool = False
     has_port: bool = False
     has_thread_patch: bool = False
@@ -224,6 +233,7 @@ class Installer:
         freertos = root / lay["freertos_c"]
         usart_c = root / lay["usart_c"]
         usart_h = root / lay["usart_h"]
+        main_c = root / self.cfg.get("main", {}).get("file", "Core/Src/main.c")
 
         scan = Scan(
             mdkarm=mdkarm,
@@ -233,6 +243,7 @@ class Installer:
             freertos=freertos if freertos.is_file() else None,
             usart_c=usart_c if usart_c.is_file() else None,
             usart_h=usart_h if usart_h.is_file() else None,
+            main_c=main_c if main_c.is_file() else None,
         )
         scan.has_driver = (driver_dir / "Unitree_GO.c").is_file()
         scan.has_port = (driver_dir / f"{lay['port_prefix']}.c").is_file()
@@ -242,14 +253,37 @@ class Installer:
             scan.has_thread_patch = MARKER in txt
 
         self._detect_uart(scan)
+        self._hint_other_channel(scan)
         self._detect_dma(scan)
         self._detect_callbacks(scan)
         self._detect_other_users(scan)
         if not scan.freertos:
-            scan.warnings.append(
-                "工程里没有 Core/Src/freertos.c —— 不会生成示例任务，请手动在初始化后调用 Unitree_GO_Port_Init() 并在循环里收发")
+            if scan.main_c is not None:
+                scan.warnings.append(
+                    "工程里没有 Core/Src/freertos.c（裸机工程）—— 会在 main.c 的 USER CODE 区"
+                    "插入 Unitree_GO_App_Init() / Unitree_GO_App_Step()")
+            else:
+                scan.warnings.append(
+                    "工程里既没有 freertos.c 也没有 main.c —— 请手动调用 Unitree_GO_Port_Init() 并在循环里收发")
         self.scan_result = scan
         return scan
+
+    def _hint_other_channel(self, scan: Scan) -> None:
+        """用户没选的那一路串口如果已经在工程里跑 4 Mbps，多半是想用那一路。"""
+        other = "2" if str(self.opts.channel) == "1" else "1"
+        info = self.cfg["channel_map"][other]
+        name, inst = info["uart_name"], info["instance"]
+
+        blob = ""
+        for p in self._project_sources(scan):
+            try:
+                blob += read_text(p) + "\n"
+            except Exception:
+                continue
+        if re.search(rf"{name}\.Init\.BaudRate\s*=\s*4000000", blob):
+            scan.warnings.append(
+                f"工程里已经有 {name}（{inst}）跑 4 Mbps —— 如果电机是接在另一路 485 上，"
+                f"请选通道 {other}（GUI 里点一下，或命令加 --channel {other}），这样可以复用现有串口配置")
 
     def _detect_uart(self, scan: Scan) -> None:
         """决定复用工程现有串口句柄，还是由移植层自己建。"""
@@ -261,7 +295,8 @@ class Installer:
         declared = False
         inited = False
         baud = None
-        for p in (scan.usart_c, scan.usart_h):
+        # CubeMX 既可能把串口初始化放在 usart.c，也可能全放在 main.c（没有 usart.h）
+        for p in (scan.usart_c, scan.usart_h, scan.main_c):
             if p and p.is_file():
                 txt = read_text(p)
                 if re.search(rf"UART_HandleTypeDef\s+{uart_name}\s*;", txt):
@@ -379,6 +414,8 @@ class Installer:
                     continue
                 if scan.freertos and p.resolve() == scan.freertos.resolve():
                     continue          # 这个文件是本工具自己打补丁的，不算“别人的接入代码”
+                if scan.main_c and p.resolve() == scan.main_c.resolve():
+                    continue          # 裸机工程：main.c 里会插我们的 App_Init/App_Step
                 if scan.cb_rx_file and p.resolve() == scan.cb_rx_file.resolve():
                     continue          # HAL 回调文件里会插我们的转发，也不算
                 if scan.cb_err_file and p.resolve() == scan.cb_err_file.resolve():
@@ -449,13 +486,17 @@ class Installer:
             self._install_port(scan)
             self._patch_callbacks(scan)
 
-        # 3) freertos 线程
+        # 3) 示例代码：RTOS 工程插线程，裸机工程插 main 的主循环
         if skip_port:
             pass
-        elif o.with_task and scan.freertos:
+        elif not o.with_task:
+            self.log("[跳过] --no-task：不生成示例代码，请自行调用 Unitree_GO_Port_Init() 并收发")
+        elif scan.freertos:
             self._patch_freertos(scan)
-        elif not scan.freertos:
-            self.log("[跳过] 没有 freertos.c，不生成示例任务")
+        elif scan.main_c is not None:
+            self._patch_main(scan)
+        else:
+            self.log("[跳过] 既没有 Core/Src/freertos.c 也没有 Core/Src/main.c，示例代码没处放")
 
         # 4) Keil 工程
         self._patch_uvprojx(scan, with_port=not skip_port)
@@ -509,6 +550,15 @@ class Installer:
         info = self.cfg["channel_map"][str(o.channel)]
         nl = "\n"
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        baremetal = scan.freertos is None          # 裸机工程：用 App_Init/App_Step 而不是 RTOS 线程
+
+        if baremetal:
+            task_decl = """/* 裸机用法：main 里调一次 Init，while(1) 里每轮调一次 Step
+ * （返回 1 = 这一轮收到了有效反馈） */
+void    Unitree_GO_App_Init(void);
+uint8_t Unitree_GO_App_Step(void);"""
+        else:
+            task_decl = "void APP_Unitree_GO_Task(void *argument);"
 
         # ---------------- 头文件 ----------------
         head = f"""/**
@@ -545,8 +595,8 @@ class Installer:
 /* 初始化 485 + 电机句柄（幂等，可重复调用） */
 void Unitree_GO_Port_Init(void);
 
-/* 示例任务：先零力矩 UG_PORT_SETTLE_MS 毫秒，再位置伺服到 UG_PORT_DEMO_POS 并保持 */
-void APP_Unitree_GO_Task(void *argument);
+/* 示例代码 */
+{task_decl}
 
 /* 给调试器/其它模块用的全局句柄 */
 extern Unitree_GO_HandleTypeDef g_go_joint;
@@ -625,6 +675,10 @@ static void UG_Port_UartInit(void)
             Error_Handler();
         }}
     }}
+
+    /* 空闲中断靠串口全局中断：CubeMX 里没勾的话这里补上（重复使能无副作用） */
+    HAL_NVIC_SetPriority({inst}_IRQn, {irq_prio}, 0);
+    HAL_NVIC_EnableIRQ({inst}_IRQn);
 }}"""
         else:
             uart_section = f"""/* ---- 串口：工程里没有 {uart_name}，这里自己建 {inst} ---------------
@@ -716,9 +770,34 @@ static void UG_Port_UartInit(void)
             callback_section = ("/* ---- HAL 回调：工程里没有，这里定义（空闲中断靠它分发） ---- */\n"
                                 + "\n\n".join(cb_parts) + "\n")
 
-        rtos_include = '#include "cmsis_os.h"' if (self.opts.with_task and scan.freertos) else ""
+        rtos_include = '#include "cmsis_os.h"' if (self.opts.with_task and not baremetal) else ""
         task_body = ""
-        if self.opts.with_task and scan.freertos:
+        if self.opts.with_task and baremetal:
+            task_body = f"""
+/* ---- 裸机用法 --------------------------------------------------------
+ * main() 里调一次 Unitree_GO_App_Init()；
+ * while (1) 里每轮调一次 Unitree_GO_App_Step()，中间给个 UG_PORT_PERIOD_MS 的延时。
+ * 配置工具会把这几个调用自动插进 main.c 的 USER CODE 区（带 {MARKER} 标注）。 */
+void Unitree_GO_App_Init(void)
+{{
+    Unitree_GO_Port_Init();             /* 幂等：串口 + DMA + 电机句柄 + 武装接收 */
+
+    /* 先收一帧拿到当前位置，再把它记成关节 0 点（只改 RAM 偏移，不动电机） */
+    if (Unitree_GO_SendRecv(&g_go_joint) != 0u)
+    {{
+        Unitree_GO_SetZeroPosition(&g_go_joint);
+    }}
+}}
+
+uint8_t Unitree_GO_App_Step(void)
+{{
+    Unitree_GO_Port_Init();             /* 幂等，忘了先调 App_Init 也不会炸 */
+
+    Unitree_GO_MITMode(&g_go_joint, UG_PORT_DEMO_POS, 0.0f,
+                       UG_PORT_DEMO_KP, UG_PORT_DEMO_KD, 0.0f);
+    return Unitree_GO_SendRecv(&g_go_joint);
+}}"""
+        elif self.opts.with_task:               # RTOS 工程：示例线程
             task_body = f"""
 /* ---- 示例任务 --------------------------------------------------------
  * 上电先零力矩 UG_PORT_SETTLE_MS（手拨能轻松转 = 通信与 FOC 都正常），
@@ -915,6 +994,47 @@ const osThreadAttr_t unitree_go_attributes = {{
         self.log(f"[修改] {rel}（插入 {', '.join(applied)}）")
         self.changes.append(("patched", str(rel), bak))
 
+    # ---- 3b) main.c（裸机工程） ----
+    def _patch_main(self, scan: Scan) -> None:
+        assert scan.main_c is not None
+        path = scan.main_c
+        text = read_text(path)
+        rel = path.relative_to(scan.root)
+
+        if MARKER in text:
+            self.log(f"[不变] {rel}（main 里已接好）")
+            self.changes.append(("unchanged", str(rel), None))
+            return
+        if self.opts.dry_run:
+            self.log(f"[将修改] {rel}（插 include / App_Init / App_Step）")
+            self.changes.append(("would-patch", str(rel), None))
+            return
+
+        blocks = self.cfg["main"]["blocks"]
+        snippets = (
+            ("includes", '#include "Unitree_GO_port.h"'),
+            ("init", f"  Unitree_GO_App_Init();      /* {MARKER}: 串口 + DMA + 电机句柄 + 记零点 */"),
+            ("loop", (f"    Unitree_GO_App_Step();      /* {MARKER}: 位置伺服 + 收发 */"
+                      f"\n    HAL_Delay(UG_PORT_PERIOD_MS);")),
+        )
+
+        new_text, missing = text, []
+        for key, code in snippets:
+            begin, _end = blocks[key]
+            new_text, ok = self._insert_after_line(new_text, begin, code)
+            if not ok:
+                missing.append(key)
+
+        if missing:
+            self.log(f"[跳过] {rel} 里找不到 USER CODE 锚点（{', '.join(missing)}），"
+                     "请手动加：Unitree_GO_App_Init(); + while(1) 里 Unitree_GO_App_Step();")
+            return
+
+        bak = self._backup(path)
+        write_text(path, new_text)
+        self.log(f"[修改] {rel}（插入 include / App_Init / App_Step）")
+        self.changes.append(("patched", str(rel), bak))
+
     @staticmethod
     def _insert_after_line(text: str, anchor: str, code: str) -> tuple[str, bool]:
         if anchor not in text:
@@ -1049,7 +1169,7 @@ const osThreadAttr_t unitree_go_attributes = {{
             f"DMA        : {'复用工程自带' if scan.dma_owned_by == 'project' else '移植层生成'} "
             f"{scan.dma_stream or '-'} / {scan.dma_irq or '-'}",
             f"电机 ID    : {self.opts.motor_id}   减速比 {self.opts.ratio}",
-            f"示例任务   : {'生成' if (self.opts.with_task and scan.freertos and not scan.other_user_files) else '未生成'}",
+            f"示例代码   : {'未生成' if not self.opts.with_task else ('裸机 App_Init/App_Step' if not scan.freertos else 'RTOS 线程 UnitreeGO')}",
             "",
             "改动明细：",
         ]
@@ -1183,14 +1303,14 @@ def run_gui() -> int:
         def open_backup(self) -> None:
             p = self.path_var.get().strip()
             if not p:
-                messagebox.showinfo("提示", "先选择工程目录")
+                self._msg("info", "提示", "先选择工程目录")
                 return
             base = Path(p)
             if not (base / self.cfg["layout"]["backup_dir"]).is_dir() and (base / "MDK-ARM").is_dir():
                 base = base / "MDK-ARM"
             target = base / self.cfg["layout"]["backup_dir"]
             if not target.is_dir():
-                messagebox.showinfo("提示", "还没有备份目录（尚未配置过）")
+                self._msg("info", "提示", "还没有备份目录（尚未配置过）")
                 return
             self._open(target)
 
@@ -1203,8 +1323,17 @@ def run_gui() -> int:
                     os.system(f'open "{p}"')
                 else:
                     os.system(f'xdg-open "{p}"')
-            except Exception as e:
-                messagebox.showerror("打不开", str(e))
+            except Exception:
+                pass          # 打不开就算了，不要因为一个弹窗把流程搞崩
+
+        def _msg(self, kind: str, title: str, text: str) -> None:
+            """弹窗包装：窗口系统异常时只写日志，绝不吞掉/覆盖已经完成的配置结果。"""
+            self._log(f"[{title}] {text}")
+            try:
+                {"error": messagebox.showerror,
+                 "warn": messagebox.showwarning}.get(kind, messagebox.showinfo)(title, text)
+            except Exception:
+                pass
 
         def _log(self, msg: str) -> None:
             self.log_box.configure(state="normal")
@@ -1213,7 +1342,7 @@ def run_gui() -> int:
             self.log_box.configure(state="disabled")
             self.update_idletasks()
 
-        def _options(self) -> Options:
+        def _collect_options(self) -> Options:
             return Options(
                 channel=int(self.channel_var.get()),
                 motor_id=int(self.id_var.get()),
@@ -1228,10 +1357,10 @@ def run_gui() -> int:
         def scan_click(self) -> None:
             p = self.path_var.get().strip()
             if not p:
-                messagebox.showwarning("提示", "请先选择 MDK-ARM 目录")
+                self._msg("warn", "提示", "请先选择 MDK-ARM 目录")
                 return
             try:
-                inst = Installer(Path(p), self._options(), self.cfg, log=self._log)
+                inst = Installer(Path(p), self._collect_options(), self.cfg, log=self._log)
                 s = inst.resolve()
                 self._log("—" * 40)
                 self._log(f"工程根目录 : {s.root}")
@@ -1246,17 +1375,17 @@ def run_gui() -> int:
                 self._log("—" * 40)
             except Exception as e:
                 self._log(f"[错误] {e}")
-                messagebox.showerror("检测失败", str(e))
+                self._msg("error", "检测失败", str(e))
 
         def install_click(self) -> None:
             p = self.path_var.get().strip()
             if not p:
-                messagebox.showwarning("提示", "请先选择 MDK-ARM 目录")
+                self._msg("warn", "提示", "请先选择 MDK-ARM 目录")
                 return
             try:
-                opts = self._options()
+                opts = self._collect_options()
             except ValueError as e:
-                messagebox.showerror("参数错误", f"数值填错了：{e}")
+                self._msg("error", "参数错误", f"数值填错了：{e}")
                 return
             self._save_last(p)
             self.go_btn.configure(state="disabled")
@@ -1272,14 +1401,14 @@ def run_gui() -> int:
                 elif changed:
                     self._log(f"配置完成：{len(changed)} 处改动"
                               + (f"，备份在 {inst.backup_root}" if inst.backup_root else ""))
-                    messagebox.showinfo("完成", "配置完成！\n请用 Keil 打开工程 Rebuild。")
+                    self._msg("info-later", "完成", "配置完成！\n请用 Keil 打开工程 Rebuild。")
                 else:
                     self._log("工程已是配置状态，无需改动")
-                    messagebox.showinfo("完成", "工程已是配置状态，无需改动。")
+                    self._msg("info", "完成", "工程已是配置状态，无需改动。")
             except Exception as e:
                 self._log(f"[错误] {e}")
                 self._log(traceback.format_exc())
-                messagebox.showerror("配置失败", str(e))
+                self._msg("error", "配置失败", str(e))
             finally:
                 self.go_btn.configure(state="normal")
 

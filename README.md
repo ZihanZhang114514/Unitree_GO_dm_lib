@@ -6,7 +6,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Unitree_GO 一键配置  v1.1.0                                │
+│  Unitree_GO 一键配置  v1.1.1                                │
 │                                                             │
 │  1. 选择 Keil 工程目录（MDK-ARM）                            │
 │  [ D:\27RC\dm_demo\MDK-ARM                     ] [浏览…] [仅检测] │
@@ -122,21 +122,58 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 2. 按第 5 章在 CubeMX 里配好串口 + DMA + NVIC（或照抄工具生成的 `Unitree_GO_port.c`）；
 3. 在 `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` 里各加一行转发；
 4. Keil 工程加入 `Unitree_GO.c`，头文件路径加 `../bsp/uper`；
-5. `freertos.c` 的 USER CODE 区里建线程。
+5. `freertos.c` 的 USER CODE 区里建线程（裸机工程见 2.5）。
+
+### 2.5 裸机工程（没有 FreeRTOS）
+
+工程里没有 `Core/Src/freertos.c` 时，工具自动改走**裸机模式**：
+
+- 移植层里不再生成 RTOS 线程，而是生成两个函数：
+
+| 函数 | 调用位置 | 作用 |
+|---|---|---|
+| `void Unitree_GO_App_Init(void)` | `main()` 里**调一次** | 串口 + DMA + 电机句柄 + 武装接收 + 记一次关节零点 |
+| `uint8_t Unitree_GO_App_Step(void)` | `while (1)` 里**每轮调一次** | 位置伺服 + 收发，返回 1 = 这一轮收到有效反馈 |
+
+- 工具还会把调用**自动插进 `main.c` 的 USER CODE 区**（所以 CubeMX 重新生成不会丢）：
+
+```c
+/* USER CODE BEGIN Includes */
+#include "Unitree_GO_port.h"
+/* USER CODE END Includes */
+...
+  MX_GPIO_Init();
+  MX_USART3_UART_Init();          /* 工程自己的串口初始化（通道 2 时复用这个） */
+  /* USER CODE BEGIN 2 */
+  Unitree_GO_App_Init();          /* UNITREE_GO_AUTOCONFIG: 串口 + DMA + 电机句柄 + 记零点 */
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    Unitree_GO_App_Step();        /* UNITREE_GO_AUTOCONFIG: 位置伺服 + 收发 */
+    HAL_Delay(UG_PORT_PERIOD_MS);
+  }
+```
+
+> `main.c` 里没有 `USER CODE BEGIN 2 / 3` 标记（非 CubeMX 工程）时，工具会跳过并给出要手加的代码。不想让电机上电就动，用 `--no-task` 只装驱动和移植层。
 
 ---
 
 ## 3. 工具具体改了什么
 
-工具做 5 件事，**全部幂等**（重复运行不会重复插入），改动前全部备份：
+工具做 6 件事，**全部幂等**（重复运行不会重复插入），改动前全部备份：
 
 | # | 目标 | 动作 | 备份 |
 |---|---|---|---|
 | 1 | `bsp/uper/Unitree_GO.c` `.h` | 复制（`.h` 里的通道宏按选择写入）。已有且内容相同 → 跳过 | 内容不同才备份 |
-| 2 | `bsp/uper/Unitree_GO_port.c` `.h` | 按当前选项生成/覆盖：**串口初始化 + DMA 初始化 + 中断入口 + HAL 回调 + 示例任务** | 有旧文件才备份 |
+| 2 | `bsp/uper/Unitree_GO_port.c` `.h` | 按当前选项生成/覆盖：**串口初始化 + DMA 初始化 + 中断入口 + HAL 回调 + 示例代码（RTOS 线程或裸机 App_Init/App_Step）** | 有旧文件才备份 |
 | 3 | `app/usart_it.c` 等（工程里已有 HAL 回调时） | 在 `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` 函数体开头各插一行转发（+ 补 `#include`） | ✔ |
-| 4 | `Core/Src/freertos.c` | 在 4 个 `USER CODE` 区插入 `#include`、线程声明、线程属性、`osThreadNew()` | ✔ |
-| 5 | `R1.uvprojx` | 往 `bsp_upper` 组登记 `Unitree_GO.c` / `Unitree_GO_port.c`；给主 target 的 `IncludePath` 补 `../bsp/uper` | ✔ |
+| 4 | `Core/Src/freertos.c`（有 RTOS 时） | 在 4 个 `USER CODE` 区插入 `#include`、线程声明、线程属性、`osThreadNew()` | ✔ |
+| 5 | `Core/Src/main.c`（裸机工程） | 在 `USER CODE` 区插入 `#include`、`Unitree_GO_App_Init()`、循环里的 `Unitree_GO_App_Step()` | ✔ |
+| 6 | `R1.uvprojx` | 往 `bsp_upper` 组登记 `Unitree_GO.c` / `Unitree_GO_port.c`；给主 target 的 `IncludePath` 补 `../bsp/uper` | ✔ |
 
 - 备份位置：`<MDK-ARM>/Unitree_GO_backup/<yyyyMMdd_HHmmss>/`，保留原相对目录结构，并附 `install_report.txt`。
 - **只改 CubeMX 的 `USER CODE` 区**，CubeMX 重新生成代码时插入不会被冲掉；生成的 `Unitree_GO_port.*` 在 `bsp/uper/` 下，CubeMX 不碰。
@@ -154,13 +191,14 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 | `layout.driver_dir` | 驱动放到工程的哪个目录（相对工程根） | `bsp/uper` |
 | `layout.port_prefix` | 移植层文件名前缀 | `Unitree_GO_port` |
 | `layout.freertos_c` | 要插线程的 RTOS 文件 | `Core/Src/freertos.c` |
-| `layout.usart_c` / `usart_h` | 用来探测"工程是否已有串口"的文件 | `Core/Src/usart.c` / `Core/Inc/usart.h` |
+| `layout.usart_c` / `usart_h` | 用来探测"工程是否已有串口"的文件（CubeMX 把串口生成在 main.c 里时也能识别） | `Core/Src/usart.c` / `Core/Inc/usart.h` |
 | `layout.uvprojx_glob` | Keil 工程文件匹配模式 | `*.uvprojx` |
 | `layout.backup_dir` | 备份目录（相对 MDK-ARM） | `Unitree_GO_backup` |
 | `uvprojx.preferred_group` / `fallback_group` | 文件登记进哪个组 / 组不存在时新建的组名 | `bsp_upper` / `Unitree_GO` |
 | `uvprojx.include_entry` | 补进 `IncludePath` 的路径 | `../bsp/uper` |
 | `freertos.blocks.*` | 4 个插入锚点（USER CODE 标记） | CubeMX 标准标记 |
 | `thread.name` / `stack_words` / `priority` | 生成线程的名字、栈（字）、优先级 | `UnitreeGO` / `512` / `osPriorityNormal` |
+| `main.file` / `main.blocks.*` | 裸机工程要插代码的 main.c 与 3 个锚点（Includes / 2 / 3） | `Core/Src/main.c` |
 | `dma.irq_priority` | 生成的 DMA / 串口中断优先级 | `5` |
 | `dma.controller` / `fallback` | 优先用哪个 DMA 控制器 | `DMA1` / `DMA2` |
 | `callbacks.rx_event` / `error` | 工程里 HAL 回调的函数名（用于探测和插转发） | `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` |
@@ -182,6 +220,8 @@ DM-MC-Board02 板载两路高速 RS485（最高 10 Mbps，丝印 RS485-U2 / RS48
 | 2 | USART3 | PD8 | PD9 | PB14 | `DMA_REQUEST_USART3_RX` = 45 |
 
 选通道：`Unitree_GO.h` 里的 `UNITREE_GO_485_CHANNEL`（1 或 2），工具会按 GUI/CLI 的选择写好。
+
+> **先看看工程里已经配了哪路**：如果你在 CubeMX 里已经配过 USART3 且波特率是 4000000（很常见——这块板子第 2 路 485 就是 USART3/PD8 PD9），工具会在日志里提示，选**通道 2** 就能直接复用你现有的串口配置，不用另外建 USART2。
 
 ### 5.2 CubeMX 里怎么配
 
@@ -591,6 +631,12 @@ if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 **Q：我不在 CubeMX 里配 DMA，能跑吗？**
 能。驱动检测到 `hdmarx == NULL` 会自动退回阻塞接收（效率低）。但工具生成移植层时本来就会帮你把 DMA 配好。
 
+**Q：没有 FreeRTOS 的工程能用吗？**
+能。工具会走裸机模式，生成 `Unitree_GO_App_Init()` / `Unitree_GO_App_Step()`，并自动插进 `main.c` 的 USER CODE 区（见 2.5）。没有 USER CODE 标记时给出要手加的代码。
+
+**Q：工程里没有 `usart.h` 会不会编译不过？**
+不会。驱动只 include `main.h`（CubeMX 把串口初始化生成在 `main.c` 里的工程本来就没有 `usart.h`）。`huart2/huart3` 的声明要么来自工程的 `usart.h`，要么来自移植层。
+
 **Q：一个工程多个电机？**
 一个 `Unitree_GO_HandleTypeDef` 对应一个电机；同一路 485 上多个电机时，回包按 ID 自动分发，在同一个任务里按 ID 依次收发即可（半双工不能并发发）。
 
@@ -604,6 +650,7 @@ if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 
 ## 版本
 
+- **v1.1.1** — 修 3 个实测问题：① GUI 的 `_options` 与 tkinter 内部方法重名（点「完成」弹窗报 TypeError）；② 驱动不再 include `usart.h`（否则"串口初始化生成在 main.c、没有 usart.h"的工程直接编译失败）；③ 裸机工程现在会自动生成 `App_Init/App_Step` 并插进 `main.c`。另加：复用工程现有串口时补 NVIC 使能、自动识别 main.c 里的串口定义、提示另一路已在跑 4 Mbps 的串口。
 - **v1.1.0** — 接收改为 **DMA + 空闲中断**：`StartRx/StopRx/Poll/Send/RxEvent/Error` 新 API，`SendRecv` 变成"发 + 等 3 ms"，半双工发送期间自动关接收；工具自动生成 DMA/中断/回调并支持复用工程已有配置。
 - **v1.0.0** — 驱动 + 一键配置工具首发（阻塞接收）。
 
