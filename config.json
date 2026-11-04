@@ -1,7 +1,7 @@
 {
   "lib": {
     "name": "Unitree_GO",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "description": "宇树 GO-M8010-6 关节电机驱动（半双工 RS485，DMA + 空闲中断接收）+ Keil 工程一键配置工具",
     "driver_files": ["Unitree_GO.c", "Unitree_GO.h"]
   },

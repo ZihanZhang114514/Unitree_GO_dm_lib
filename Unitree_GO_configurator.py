@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 LIB_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = LIB_DIR / "config.json"
 LAST_PATH_FILE = Path(tempfile.gettempdir()) / "unitree_go_configurator.json"
@@ -231,7 +231,9 @@ class Installer:
     def _spec(self) -> dict:
         """把“通道 1/2”或“自选串口”统一成一份移植层参数。"""
         o = self.opts
-        if o.uart:
+        if o.uart or int(o.channel) == 3:
+            if not o.uart:
+                raise ValueError("选了「3 自选串口」但没填串口名（例如 USART6）")
             inst = o.uart.strip().upper()
             m = re.fullmatch(r"(USART|UART|LPUART)(\d+)", inst)
             if not m:
@@ -633,8 +635,10 @@ class Installer:
         o = self.opts
         lay = self.cfg["layout"]
         prefix = lay["port_prefix"]
-        info = self.cfg["channel_map"][str(o.channel)]
         spec = self._spec()
+        # 通道 3（自选串口）不查 channel_map；tx/rx/af 只在“自己建串口”时才用，自选串口不走那条路
+        info = ({"tx_pin": 0, "rx_pin": 0, "af": "", "de_port": "NULL", "de_pin": 0}
+                if spec["custom"] else self.cfg["channel_map"][str(o.channel)])
         nl = "\n"
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         baremetal = scan.freertos is None          # 裸机工程：用 App_Init/App_Step 而不是 RTOS 线程
