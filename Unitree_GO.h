@@ -30,10 +30,21 @@
  *
  *   通道 1：USART2：PD5=TX / PD6=RX，方向脚 DE = PD4
  *   通道 2：USART3：PD8=TX / PD9=RX，方向脚 DE = PB14
+ *   通道 3：自定义（自选串口）—— 见本节末尾说明
  *
  * 两路串口都在 usart.c 里按 4Mbps 配好了。电机插在哪个 485 口上就选哪一路，
  * 拿不准就先用 1，收不到回包（timeout_cnt 一直涨）再改成 2 试。
  * DE 方向脚由 Unitree_GO_Init() 自己初始化，不用在 CubeMX / gpio.c 里再配。
+ *
+ * ---- 通道 3：自选串口（两线 485 / 三线 UART）--------------------------------
+ * 板载 485 口只引出 A/B 两线、或者你要接的是三线 TTL 串口（TX/RX/GND）时，
+ * 把 UNITREE_GO_485_CHANNEL 设成 3，并在移植层 Unitree_GO_port.h 里给出：
+ *      UG_PORT_UART     用哪个串口句柄（CubeMX 里配好的，如 huart6）
+ *      UG_PORT_DE_PORT  方向脚端口；填 NULL 表示没有方向脚（两线 485 / 三线直连）
+ *      UG_PORT_DE_PIN   方向脚引脚，没有就填 0u
+ *      UG_PORT_BAUD     波特率（默认 4 Mbps，直连普通串口设备时按对方改）
+ * 此时本头文件不定义 UNITREE_GO_485_UART / DE_PORT / DE_PIN 这三个宏，
+ * 一切以移植层为准（一键配置工具会自动生成）。
  *============================================================================*/
 #define UNITREE_GO_485_CHANNEL      1
 
@@ -45,8 +56,10 @@
     #define UNITREE_GO_485_UART     huart3
     #define UNITREE_GO_DE_PORT      GPIOB
     #define UNITREE_GO_DE_PIN       GPIO_PIN_14
+#elif (UNITREE_GO_485_CHANNEL == 3)
+    /* 自定义：句柄和方向脚由 Unitree_GO_port.h 的 UG_PORT_* 提供，本文件不定义 */
 #else
-    #error "UNITREE_GO_485_CHANNEL 只能是 1 或 2"
+    #error "UNITREE_GO_485_CHANNEL 只能是 1（USART2）、2（USART3）或 3（自定义）"
 #endif
 
 /*==============================================================================

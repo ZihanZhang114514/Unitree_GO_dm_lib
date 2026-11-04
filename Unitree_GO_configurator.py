@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 LIB_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = LIB_DIR / "config.json"
 LAST_PATH_FILE = Path(tempfile.gettempdir()) / "unitree_go_configurator.json"
@@ -98,6 +98,9 @@ DEFAULT_CONFIG: dict = {
         "demo_pos": 0.5,
         "demo_kp": 4.0,
         "demo_kd": 1.0,
+        "uart": "",
+        "de_pin": "",
+        "baud": 4000000,
     },
     "channel_map": {
         "1": {
@@ -167,6 +170,10 @@ class Options:
     with_task: bool = True
     dry_run: bool = False
     force: bool = False
+    # ---- 自选串口（通道 3）：uart 非空即启用 ----
+    uart: str = ""          # 例如 "USART6" / "UART4" / "LPUART1"
+    de_pin: str = ""        # 例如 "PB14"；空 = 没有 485 方向脚（两线 485 / 三线直连）
+    baud: int = 0           # 0 = 用默认值（板载 4 Mbps）
 
 
 @dataclass
@@ -208,6 +215,63 @@ class Installer:
         self.scan_result: Scan | None = None
         self.changes: list[tuple[str, str, Path | None]] = []   # (动作, 说明, 备份路径)
         self.backup_root: Path | None = None
+
+    # ---------------- 端口规格（通道 1/2 或 自选串口） ----------------
+    @staticmethod
+    def _parse_pin(text: str) -> tuple:
+        """'PB14' -> ('GPIOB', 14)；空 / none -> (None, 0)"""
+        t = (text or "").strip().upper().replace("GPIO", "").replace("_", "")
+        if not t or t in ("NONE", "NO", "-", "0"):
+            return None, 0
+        m = re.fullmatch(r"P([A-K])(\d{1,2})", t)
+        if not m:
+            raise ValueError(f"引脚写法不对：{text}（应为 PB14 这种形式，或留空表示没有方向脚）")
+        return f"GPIO{m.group(1)}", int(m.group(2))
+
+    def _spec(self) -> dict:
+        """把“通道 1/2”或“自选串口”统一成一份移植层参数。"""
+        o = self.opts
+        if o.uart:
+            inst = o.uart.strip().upper()
+            m = re.fullmatch(r"(USART|UART|LPUART)(\d+)", inst)
+            if not m:
+                raise ValueError(
+                    f"串口名写法不对：{o.uart}（应为 USART1…USART10 / UART4…UART9 / LPUART1）")
+            name = ("hlpuart" if m.group(1) == "LPUART" else "huart") + m.group(2)
+            de_port, de_num = self._parse_pin(o.de_pin)
+            return {
+                "custom": True,
+                "channel": 3,
+                "instance": inst,
+                "uart_name": name,
+                "de_port": de_port if de_port else "NULL",
+                "de_pin": f"GPIO_PIN_{de_num}" if de_port else "0u",
+                "de_text": (f"{de_port} pin{de_num}" if de_port else "无（两线 485 / 三线直连）"),
+                "baud": int(o.baud or 4000000),
+                "dma_request": f"DMA_REQUEST_{inst}_RX",
+                # 通道 3 时驱动头文件不定义 UNITREE_GO_485_*，这里补一份兼容别名，
+                # 让照着旧 README 写的代码（&UNITREE_GO_485_UART）也能编过
+                "compat": """
+/* ---- 兼容别名：旧代码里写 UNITREE_GO_485_UART / DE_PORT / DE_PIN 也能编过 ---- */
+#define UNITREE_GO_485_UART         UG_PORT_UART
+#define UNITREE_GO_DE_PORT          UG_PORT_DE_PORT
+#define UNITREE_GO_DE_PIN           UG_PORT_DE_PIN
+""",
+            }
+
+        info = self.cfg["channel_map"][str(o.channel)]
+        return {
+            "custom": False,
+            "channel": int(o.channel),
+            "instance": info["instance"],
+            "uart_name": info["uart_name"],
+            "de_port": info["de_port"],
+            "de_pin": f"GPIO_PIN_{info['de_pin']}",
+            "de_text": f"{info['de_port']} pin{info['de_pin']}",
+            "baud": 4000000,
+            "dma_request": info.get("dma_request", ""),
+            "compat": "",
+        }
 
     # ---------------- 定位与检测 ----------------
     def resolve(self) -> Scan:
@@ -271,6 +335,8 @@ class Installer:
 
     def _hint_other_channel(self, scan: Scan) -> None:
         """用户没选的那一路串口如果已经在工程里跑 4 Mbps，多半是想用那一路。"""
+        if self.opts.uart:
+            return              # 自选串口模式不做这个提示
         other = "2" if str(self.opts.channel) == "1" else "1"
         info = self.cfg["channel_map"][other]
         name, inst = info["uart_name"], info["instance"]
@@ -288,10 +354,10 @@ class Installer:
 
     def _detect_uart(self, scan: Scan) -> None:
         """决定复用工程现有串口句柄，还是由移植层自己建。"""
-        ch = str(self.opts.channel)
-        info = self.cfg["channel_map"][ch]
-        uart_name = info["uart_name"]
-        inst = info["instance"]
+        spec = self._spec()
+        uart_name = spec["uart_name"]
+        inst = spec["instance"]
+        want_baud = spec["baud"]
 
         declared = False
         inited = False
@@ -308,17 +374,24 @@ class Installer:
                 if m:
                     baud = int(m.group(1))
 
+        if spec["custom"] and not declared:
+            raise RuntimeError(
+                f"没有在工程里找到 {uart_name}（{inst}）—— 自选串口用的是你在 CubeMX 里已经配好的那一路。\n"
+                f"  办法一：在 CubeMX 里加 {inst}（Mode=Asynchronous，引脚随便选，波特率按设备来），"
+                f"生成代码后重新运行本工具；\n"
+                f"  办法二：先选通道 1/2 由工具自己建 USART2/USART3（板载 485 用）。")
+
         if declared:
             scan.uart_owned_by = "project"
             scan.uart_reason = (
                 f"工程里已有 {uart_name} 句柄" + (f"（{baud} bps）" if baud else ""))
-            if inited and baud != 4000000:
+            if inited and baud != want_baud:
                 scan.warnings.append(
-                    f"{uart_name} 当前波特率是 {baud}，不是 4000000 —— 移植层会在启动时把它改成 4 Mbps"
-                    "（依赖工程里已调用过 MX_" + inst + "_UART_Init）")
+                    f"{uart_name} 当前波特率是 {baud}，与要求的 {want_baud} 不一致 —— "
+                    f"移植层会在启动时把它改成 {want_baud}（依赖工程里已调用过 MX_{inst}_UART_Init）")
         else:
             scan.uart_owned_by = "installer"
-            scan.uart_reason = f"工程里没有 {uart_name}，由移植层自己建 {inst}（4 Mbps）"
+            scan.uart_reason = f"工程里没有 {uart_name}，由移植层自己建 {inst}（{want_baud} bps）"
 
     # ---- DMA / 回调检测 ----
     def _port_paths(self, scan: Scan) -> set:
@@ -345,9 +418,9 @@ class Installer:
 
     def _detect_dma(self, scan: Scan) -> None:
         """决定 DMA 用工程现成的，还是由移植层生成（自动挑一个空闲 stream）。"""
-        info = self.cfg["channel_map"][str(self.opts.channel)]
-        inst = info["instance"]
-        req = info.get("dma_request", "")
+        spec = self._spec()
+        inst = spec["instance"]
+        req = spec["dma_request"]
 
         blob = ""
         for p in self._project_sources(scan):
@@ -526,7 +599,7 @@ class Installer:
                 raise FileNotFoundError(f"库目录里缺少 {name}")
             text = read_text(src)
             if name.endswith(".h"):
-                text = self._set_channel(text, self.opts.channel)
+                text = self._set_channel(text, self._spec()["channel"])
             self._put_file(scan.driver_dir / name, text, scan)
 
     def _set_channel(self, header_text: str, channel: int) -> str:
@@ -561,6 +634,7 @@ class Installer:
         lay = self.cfg["layout"]
         prefix = lay["port_prefix"]
         info = self.cfg["channel_map"][str(o.channel)]
+        spec = self._spec()
         nl = "\n"
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         baremetal = scan.freertos is None          # 裸机工程：用 App_Init/App_Step 而不是 RTOS 线程
@@ -581,7 +655,7 @@ uint8_t Unitree_GO_App_Step(void);"""
   *
   * 生成时间 : {stamp}
   * 配置来源 : MDK-ARM/Unitree_GO_dm_lib/config.json
-  * 485 通道 : {o.channel}（{info['instance']} {info['uart_name']}，DE={info['de_port']} pin{info['de_pin']}）
+  * 485 通道 : {spec['channel']}（{spec['instance']} {spec['uart_name']}，DE={spec['de_text']}，{spec['baud']} bps）
   * DMA 接收 : {"工程自带" if scan.dma_owned_by == "project" else (scan.dma_stream or "移植层生成")}（空闲中断判帧尾）
   * 电机 ID  : {o.motor_id}    减速比 : {o.ratio}
   *
@@ -595,6 +669,13 @@ uint8_t Unitree_GO_App_Step(void);"""
 #include "main.h"
 #include "Unitree_GO.h"
 
+/* ---- 用的串口 / 485 方向脚（改这里就能换口，不用动驱动） --------------- */
+#define UG_PORT_INSTANCE            {spec['instance']}
+#define UG_PORT_UART                {spec['uart_name']}
+#define UG_PORT_DE_PORT             {spec['de_port']}      /* NULL = 没有方向脚（两线 485 / 三线直连） */
+#define UG_PORT_DE_PIN              {spec['de_pin']}
+#define UG_PORT_BAUD                {spec['baud']}u
+{spec['compat']}
 /* ---- 用户可调参数 ---------------------------------------------------- */
 #define UG_PORT_MOTOR_ID            {o.motor_id}u      /* 电机 ID，必须和电机里烧的一致（0~14） */
 #define UG_PORT_RATIO               {o.ratio}f    /* GO-M8010-6 减速比 */
@@ -618,13 +699,14 @@ extern Unitree_GO_HandleTypeDef g_go_joint;
 """
 
         # ---------------- 源文件 ----------------
-        uart_name = info["uart_name"]
-        inst = info["instance"]
-        tx_pin = info["tx_pin"]
-        rx_pin = info["rx_pin"]
-        af = info["af"]
+        uart_name = spec["uart_name"]
+        inst = spec["instance"]
+        baud = spec["baud"]
+        tx_pin = info.get("tx_pin", 0)
+        rx_pin = info.get("rx_pin", 0)
+        af = info.get("af", "")
 
-        dma_req = info.get("dma_request", "")
+        dma_req = spec["dma_request"]
         stream = scan.dma_stream or "DMA1_Stream0"
         dma_ctrl = stream.split("_")[0]
         dma_irq = scan.dma_irq or f"{stream}_IRQn"
@@ -681,14 +763,14 @@ UART_HandleTypeDef {uart_name};"""
 
         if scan.uart_owned_by == "project":
             uart_section = f"""/* ---- 串口：复用工程里已有的 {uart_name}（{inst}）---------------------
- * 工程自己的 MX_{inst}_UART_Init() 负责引脚/时钟；这里只保证波特率是 4 Mbps。
+ * 工程自己的 MX_{inst}_UART_Init() 负责引脚/时钟；这里只保证波特率是 {baud}。
  * {"DMA 由本移植层补上（见上面的 UG_Port_DmaInit）。" if dma_installer else "DMA 工程里已经配好，直接用。"}
  * 如果工程还没调用过串口初始化，请在 main() 里调用 MX_{inst}_UART_Init()。 */
 static void UG_Port_UartInit(void)
 {{
-{dma_call}    if (({uart_name}.Instance == {inst}) && ({uart_name}.Init.BaudRate != 4000000u))
+{dma_call}    if (({uart_name}.Instance == {inst}) && ({uart_name}.Init.BaudRate != UG_PORT_BAUD))
     {{
-        {uart_name}.Init.BaudRate = 4000000u;
+        {uart_name}.Init.BaudRate = UG_PORT_BAUD;
         if (HAL_UART_Init(&{uart_name}) != HAL_OK)
         {{
             Error_Handler();
@@ -730,7 +812,7 @@ static void UG_Port_UartInit(void)
     HAL_GPIO_Init({info['de_port']}, &gpio);
 
     {uart_name}.Instance = {inst};
-    {uart_name}.Init.BaudRate = 4000000;
+    {uart_name}.Init.BaudRate = UG_PORT_BAUD;
     {uart_name}.Init.WordLength = UART_WORDLENGTH_8B;
     {uart_name}.Init.StopBits = UART_STOPBITS_1;
     {uart_name}.Init.Parity = UART_PARITY_NONE;
@@ -859,7 +941,7 @@ void APP_Unitree_GO_Task(void *argument)
   * @brief   宇树 GO-M8010-6 移植层（由 Unitree_GO_configurator.py 生成）
   *
   * 生成时间 : {stamp}
-  * 485 通道 : {o.channel}（{inst}，TX={tx_pin} RX={rx_pin}，DE={info['de_port']} pin{info['de_pin']}）
+  * 485 通道 : {spec['channel']}（{inst}，TX={tx_pin} RX={rx_pin}，DE={spec['de_text']}，{baud} bps）
   *
   * 本文件带 {MARKER} 标记，重新运行配置工具会整份覆盖。
   * 不想被覆盖的改动请放到别的文件里。
@@ -891,8 +973,8 @@ void Unitree_GO_Port_Init(void)
 
     /* DE 方向脚由驱动自己初始化；这里只做句柄绑定
      * （Unitree_GO_Init 内部会自动武装 DMA + 空闲中断接收） */
-    Unitree_GO_Init(&g_go_joint, &UNITREE_GO_485_UART,
-                    UNITREE_GO_DE_PORT, UNITREE_GO_DE_PIN,
+    Unitree_GO_Init(&g_go_joint, &UG_PORT_UART,
+                    UG_PORT_DE_PORT, UG_PORT_DE_PIN,
                     UG_PORT_MOTOR_ID, UG_PORT_RATIO);
 }}
 {task_body}
@@ -1186,7 +1268,7 @@ const osThreadAttr_t unitree_go_attributes = {{
             f"工程根目录 : {scan.root}",
             f"Keil 工程  : {scan.uvprojx}",
             f"驱动目录   : {scan.driver_dir}",
-            f"485 通道   : {self.opts.channel}  ({scan.uart_reason})",
+            f"485 通道   : {self._spec()['channel']}  ({scan.uart_reason})",
             f"DMA        : {'复用工程自带' if scan.dma_owned_by == 'project' else '移植层生成'} "
             f"{scan.dma_stream or '-'} / {scan.dma_irq or '-'}",
             f"电机 ID    : {self.opts.motor_id}   减速比 {self.opts.ratio}",
@@ -1236,6 +1318,9 @@ def run_gui() -> int:
             self.kd_var = tk.StringVar(value=str(d["demo_kd"]))
             self.task_var = tk.BooleanVar(value=True)
             self.dry_var = tk.BooleanVar(value=False)
+            self.uart_var = tk.StringVar(value=str(d.get("uart", "")))
+            self.de_var = tk.StringVar(value=str(d.get("de_pin", "")))
+            self.baud_var = tk.StringVar(value=str(d.get("baud", 4000000)))
             self._build()
 
         # ---- 上次路径 ----
@@ -1276,6 +1361,18 @@ def run_gui() -> int:
                             variable=self.channel_var, value=1).pack(side="left")
             ttk.Radiobutton(r1, text="2（USART3 / PD8 PD9，DE=PB14）",
                             variable=self.channel_var, value=2).pack(side="left", padx=(12, 0))
+            ttk.Radiobutton(r1, text="3（自选串口）",
+                            variable=self.channel_var, value=3).pack(side="left", padx=(12, 0))
+
+            # 自选串口（通道 3）：勾 3 时生效
+            r1b = ttk.Frame(opt)
+            r1b.pack(fill="x", padx=8, pady=(0, 6))
+            ttk.Label(r1b, text="   自选串口：").pack(side="left")
+            ttk.Entry(r1b, width=10, textvariable=self.uart_var).pack(side="left")
+            ttk.Label(r1b, text="（如 USART6；需在 CubeMX 里已配好）   方向脚：").pack(side="left")
+            ttk.Entry(r1b, width=7, textvariable=self.de_var).pack(side="left")
+            ttk.Label(r1b, text="（如 PB14，留空=两线/三线无方向脚）   波特率：").pack(side="left")
+            ttk.Entry(r1b, width=10, textvariable=self.baud_var).pack(side="left")
 
             r2 = ttk.Frame(opt)
             r2.pack(fill="x", padx=8, pady=6)
@@ -1364,8 +1461,13 @@ def run_gui() -> int:
             self.update_idletasks()
 
         def _collect_options(self) -> Options:
+            ch = int(self.channel_var.get())
+            uart = self.uart_var.get().strip() if ch == 3 else ""
+            if ch == 3 and not uart:
+                raise ValueError("选了「3 自选串口」就必须填串口名，例如 USART6")
+            baud_txt = self.baud_var.get().strip()
             return Options(
-                channel=int(self.channel_var.get()),
+                channel=ch,
                 motor_id=int(self.id_var.get()),
                 period_ms=int(self.period_var.get()),
                 demo_pos=float(self.pos_var.get()),
@@ -1373,6 +1475,9 @@ def run_gui() -> int:
                 demo_kd=float(self.kd_var.get()),
                 with_task=bool(self.task_var.get()),
                 dry_run=bool(self.dry_var.get()),
+                uart=uart,
+                de_pin=self.de_var.get().strip() if ch == 3 else "",
+                baud=int(baud_txt) if (ch == 3 and baud_txt) else 0,
             )
 
         def scan_click(self) -> None:
@@ -1455,6 +1560,9 @@ def run_cli(args) -> int:
         with_task=not args.no_task,
         dry_run=args.dry_run,
         force=args.force,
+        uart=(args.uart or "").strip(),
+        de_pin=(getattr(args, "de", "") or "").strip(),
+        baud=(args.baud or 0),
     )
     inst = Installer(Path(args.mdkarm), opts, cfg, log=print)
     try:
@@ -1478,6 +1586,11 @@ def main() -> int:
         epilog="不带参数运行 = 打开 GUI。")
     ap.add_argument("--mdkarm", help="MDK-ARM 目录（含 .uvprojx），也可以给工程根目录")
     ap.add_argument("--channel", type=int, choices=(1, 2), help="485 通道：1=USART2/PD4，2=USART3/PB14")
+    ap.add_argument("--uart", help="自选串口（通道 3）：USART1…USART10 / UART4…UART9 / LPUART1，"
+                                   "要求工程里已经在 CubeMX 配好这一路")
+    ap.add_argument("--de", metavar="PIN", help="自选串口的方向脚，如 PB14；留空/ none = 无方向脚"
+                                                "（两线 485 或三线 UART 直连）")
+    ap.add_argument("--baud", type=int, help="自选串口的波特率，默认 4000000")
     ap.add_argument("--id", type=int, help="电机 ID（0~15）")
     ap.add_argument("--ratio", type=float, help="减速比，GO-M8010-6 为 6.33")
     ap.add_argument("--period", type=int, help="控制周期 ms")

@@ -6,7 +6,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Unitree_GO 一键配置  v1.1.1                                │
+│  Unitree_GO 一键配置  v1.2.0                                │
 │                                                             │
 │  1. 选择 Keil 工程目录（MDK-ARM）                            │
 │  [ D:\27RC\dm_demo\MDK-ARM                     ] [浏览…] [仅检测] │
@@ -100,6 +100,12 @@ python Unitree_GO_configurator.py --mdkarm "..." --dry-run
 :: 换通道 / ID / 控制参数
 python Unitree_GO_configurator.py --mdkarm "..." --channel 2 --id 7 --pos 0.3 --kp 8 --kd 0.5
 
+:: 自选串口（两线 485 / 三线 UART，工程里已在 CubeMX 配好 USART1）
+python Unitree_GO_configurator.py --mdkarm "..." --uart USART1 --baud 115200
+
+:: 自选串口 + 自己控 485 方向脚
+python Unitree_GO_configurator.py --mdkarm "..." --uart USART6 --de PB14
+
 :: 只装驱动，不加示例任务
 python Unitree_GO_configurator.py --mdkarm "..." --no-task
 ```
@@ -108,6 +114,9 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 |---|---|
 | `--mdkarm PATH` | MDK-ARM 目录（含 `.uvprojx`），也可以是工程根目录 |
 | `--channel {1,2}` | 485 通道：1 = USART2/PD5 PD6，DE=PD4；2 = USART3/PD8 PD9，DE=PB14 |
+| `--uart UART` | **自选串口（通道 3）**：USART1…USART10 / UART4…UART9 / LPUART1，要求工程里已在 CubeMX 配好这一路 |
+| `--de PIN` | 自选串口的方向脚（如 `PB14`）；留空/`none` = **没有方向脚**（两线 485 或三线 UART 直连） |
+| `--baud N` | 自选串口的波特率，默认 `4000000`（直连普通串口设备时按对方改，如 `115200`） |
 | `--id N` | 电机 ID（0~15） |
 | `--ratio F` | 减速比，GO-M8010-6 固定 6.33 |
 | `--period N` | 控制周期 ms（默认 10，建议 ≥ 2） |
@@ -202,8 +211,8 @@ python Unitree_GO_configurator.py --mdkarm "..." --no-task
 | `dma.irq_priority` | 生成的 DMA / 串口中断优先级 | `5` |
 | `dma.controller` / `fallback` | 优先用哪个 DMA 控制器 | `DMA1` / `DMA2` |
 | `callbacks.rx_event` / `error` | 工程里 HAL 回调的函数名（用于探测和插转发） | `HAL_UARTEx_RxEventCallback` / `HAL_UART_ErrorCallback` |
-| `defaults.*` | GUI / CLI 默认值（通道、ID、周期、kp、kd、位置） | 见文件 |
-| `channel_map.*` | 每路 485 的串口、引脚、DE、AF、DMA 请求号 | 见文件 |
+| `defaults.*` | GUI / CLI 默认值（通道、ID、周期、kp、kd、位置、自选串口 `uart`/`de_pin`/`baud`） | 见文件 |
+| `channel_map.*` | 通道 1/2 的串口、引脚、DE、AF、DMA 请求号（通道 3 自选串口不走这里） | 见文件 |
 | `marker` | 幂等标记，出现在所有插入片段里 | `UNITREE_GO_AUTOCONFIG` |
 
 ---
@@ -218,10 +227,13 @@ DM-MC-Board02 板载两路高速 RS485（最高 10 Mbps，丝印 RS485-U2 / RS48
 |---|---|---|---|---|---|
 | 1 | USART2 | PD5 | PD6 | PD4 | `DMA_REQUEST_USART2_RX` = 43 |
 | 2 | USART3 | PD8 | PD9 | PB14 | `DMA_REQUEST_USART3_RX` = 45 |
+| **3** | **自选**（USART1/6/10、UART4/5/7/8/9、LPUART1…） | 你在 CubeMX 里选的 | 同左 | 可选（不填 = 无） | `DMA_REQUEST_<UART>_RX` 自动推导 |
 
-选通道：`Unitree_GO.h` 里的 `UNITREE_GO_485_CHANNEL`（1 或 2），工具会按 GUI/CLI 的选择写好。
+选通道：`Unitree_GO.h` 里的 `UNITREE_GO_485_CHANNEL`（1 / 2 / 3），工具会按 GUI/CLI 的选择写好。
 
 > **先看看工程里已经配了哪路**：如果你在 CubeMX 里已经配过 USART3 且波特率是 4000000（很常见——这块板子第 2 路 485 就是 USART3/PD8 PD9），工具会在日志里提示，选**通道 2** 就能直接复用你现有的串口配置，不用另外建 USART2。
+>
+> 板载 485 口只引出 A/B 两线、或者干脆要接三线 TTL 串口时，用**通道 3 自选串口**（见 5.7）。
 
 ### 5.2 CubeMX 里怎么配
 
@@ -380,12 +392,67 @@ USART2_IRQHandler → HAL_UART_IRQHandler → HAL_UARTEx_RxEventCallback
 
 ---
 
+### 5.7 自选串口（两线 485 / 三线 UART）
+
+板载 485 口只引出 A/B 两线、或者你要连的是三线 TTL 串口（TX/RX/GND）时，不用挤在 USART2/USART3 上，直接指定任意一路串口：
+
+```bat
+:: 两线 485（外部模块自己管收发方向） / 三线 TTL 直连 —— 不要方向脚
+python Unitree_GO_configurator.py --mdkarm "D:\xx\MDK-ARM" --uart USART1 --baud 115200
+
+:: 需要 MCU 控 485 方向脚
+python Unitree_GO_configurator.py --mdkarm "D:\xx\MDK-ARM" --uart USART6 --de PB14
+```
+
+GUI 里选「3（自选串口）」，填串口名 / 方向脚 / 波特率即可。
+
+**前提**：这一路串口要在 **CubeMX 里已经配好**（Mode = Asynchronous、引脚、波特率、NVIC）。工具负责：
+
+| 项 | 工具做什么 |
+|---|---|
+| 串口句柄 | `extern UART_HandleTypeDef huartN;` 复用它，**不会重复定义** |
+| 波特率 | 与 `--baud`（默认 4000000）不一致时，启动时 `HAL_UART_Init()` 改成要求的 |
+| DMA | 工程里没给这路串口配 DMA → 自动挑一个空闲流生成；已配 → 直接复用 |
+| NVIC | 补 `HAL_NVIC_EnableIRQ(USARTn_IRQn)`（CubeMX 没勾也能收 IDLE） |
+| 中断入口 | 缺 `USARTn_IRQHandler` / `DMAx_StreamN_IRQHandler` 时补上 |
+| 方向脚 | `--de` 给了就由 `Unitree_GO_Init()` 初始化成推挽输出；不给则 `UG_PORT_DE_PORT = NULL`，驱动完全不碰方向脚 |
+| 头文件 | 生成 `UG_PORT_INSTANCE / UART / DE_PORT / DE_PIN / BAUD`，并补一份 `UNITREE_GO_485_UART` 等兼容别名 |
+
+生成到 `Unitree_GO_port.h` 的内容长这样：
+
+```c
+#define UG_PORT_INSTANCE            USART1
+#define UG_PORT_UART                huart1
+#define UG_PORT_DE_PORT             NULL      /* NULL = 没有方向脚（两线 485 / 三线直连） */
+#define UG_PORT_DE_PIN              0u
+#define UG_PORT_BAUD                115200u
+/* 兼容别名：旧代码里写 UNITREE_GO_485_UART / DE_PORT / DE_PIN 也能编过 */
+#define UNITREE_GO_485_UART         UG_PORT_UART
+#define UNITREE_GO_DE_PORT          UG_PORT_DE_PORT
+#define UNITREE_GO_DE_PIN           UG_PORT_DE_PIN
+```
+
+注意：
+
+- **没有方向脚时，半双工那套 DE 翻转会被自动跳过**（驱动里 `de_port == NULL` 直接 return），`StopRx/StartRx` 仍然照做，收发时序不变；
+- 方向脚由驱动初始化，**不需要**在 CubeMX 里配；
+- 波特率默认 4 Mbps（GO-M8010-6 的固定值）。直连其它普通串口设备时记得 `--baud` 跟对方一致；
+- 指定的串口在工程里找不到时，工具会直接报错并提示两种解决办法（CubeMX 里加，或改用通道 1/2）。
+
+
+---
+
 ## 6. 生成的移植层（`Unitree_GO_port.c/.h`）
 
 ### 6.1 可调宏
 
 | 宏 | 默认 | 说明 |
 |---|---|---|
+| `UG_PORT_INSTANCE` | 由通道决定 | 串口外设名（USART2 / USART3 / 自选） |
+| `UG_PORT_UART` | 同上 | 串口句柄（`huart2` / `huart3` / `huartN`） |
+| `UG_PORT_DE_PORT` | 同上 | 485 方向脚端口；`NULL` = 没有方向脚（两线 485 / 三线直连） |
+| `UG_PORT_DE_PIN` | 同上 | 方向脚引脚；无方向脚时为 `0u` |
+| `UG_PORT_BAUD` | 4000000 | 期望波特率（与工程现有不一致时启动会 `HAL_UART_Init` 校正） |
 | `UG_PORT_MOTOR_ID` | 1 | 电机 ID，必须与电机里烧的一致 |
 | `UG_PORT_RATIO` | 6.33 | 减速比 |
 | `UG_PORT_PERIOD_MS` | 10 | 控制周期 ms |
@@ -631,6 +698,9 @@ if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 **Q：我不在 CubeMX 里配 DMA，能跑吗？**
 能。驱动检测到 `hdmarx == NULL` 会自动退回阻塞接收（效率低）。但工具生成移植层时本来就会帮你把 DMA 配好。
 
+**Q：板载 485 口只有两线，或者我要接三线串口怎么办？**
+用**通道 3 自选串口**：先在 CubeMX 里配好任意一路 UART（引脚、波特率、NVIC），然后 `--uart USART6`（不给 `--de` 就没有方向脚）。详见 [5.7](#57-自选串口两线-485--三线-uart)。
+
 **Q：没有 FreeRTOS 的工程能用吗？**
 能。工具会走裸机模式，生成 `Unitree_GO_App_Init()` / `Unitree_GO_App_Step()`，并自动插进 `main.c` 的 USER CODE 区（见 2.5）。没有 USER CODE 标记时给出要手加的代码。
 
@@ -650,6 +720,7 @@ if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 
 ## 版本
 
+- **v1.2.0** — 新增**自选串口（通道 3）**：`--uart USART1…` + `--de PIN`（可省略 = 无方向脚）+ `--baud N`。用于板载 485 只引出 A/B 两线、或要直连三线 TTL 串口的场合：任意 UART、可选方向脚、自动推导 DMA 请求、复用工程里已配好的句柄（不会重复定义）、缺中断入口/回调时自动补；GUI 里也加了「3（自选串口）」。
 - **v1.1.2** — 修生成的 `Unitree_GO_port.c` 的两个编译问题（已在 Keil AC5 + 该工程 HAL 上实编验证）：
   ① `__HAL_LINKDMA(&huartx, ...)` 出现在句柄声明之前 → `error #20: identifier "huart3" is undefined`；
   ② `huart->Init.AdvancedInit` 只在新版 HAL 存在（老版是句柄顶层成员）→ `error #136: has no field "AdvancedInit"`，改为不写（全局句柄清零即等价 NO_INIT）。
