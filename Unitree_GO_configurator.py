@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 LIB_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = LIB_DIR / "config.json"
 LAST_PATH_FILE = Path(tempfile.gettempdir()) / "unitree_go_configurator.json"
@@ -196,6 +196,9 @@ class Scan:
     dma_irq: str = ""                     # 例如 DMA1_Stream3_IRQn
     dma_irq_defined: bool = False
     usart_irq_defined: bool = False
+    rs485_pol: str = ""                   # 工程用硬件 RS485 时的极性/时间（HAL_RS485Ex_Init 参数）
+    rs485_at: str = ""
+    rs485_dt: str = ""
     cb_rx_file: Path | None = None        # 工程里已有 HAL_UARTEx_RxEventCallback 的文件
     cb_err_file: Path | None = None
     other_user_files: list = field(default_factory=list)
@@ -383,6 +386,21 @@ class Installer:
                 f"生成代码后重新运行本工具；\n"
                 f"  办法二：先选通道 1/2 由工具自己建 USART2/USART3（板载 485 用）。")
 
+        # 工程若把这一路配成了「硬件 RS485（DE 由 USART 自动翻转）」，记下极性/时间：
+        # 我们改波特率时会调 HAL_UART_Init()，它会把 CR1/CR3 清零 → DEM 位被抹掉，
+        # 必须在改完之后用 HAL_RS485Ex_Init() 重新配一次，否则 DE 永远不动作。
+        for p in self._project_sources(scan):
+            try:
+                txt = read_text(p)
+            except Exception:
+                continue
+            m = re.search(
+                rf"HAL_RS485Ex_Init\(\s*&?\s*{uart_name}\s*,\s*(UART_DE_POLARITY_\w+)\s*,"
+                rf"\s*(\d+)\s*,\s*(\d+)\s*\)", txt)
+            if m:
+                scan.rs485_pol, scan.rs485_at, scan.rs485_dt = m.group(1), m.group(2), m.group(3)
+                break
+
         if declared:
             scan.uart_owned_by = "project"
             scan.uart_reason = (
@@ -556,6 +574,10 @@ class Installer:
             self.log(f"DMA 策略    : 生成（{scan.dma_stream} / {scan.dma_irq}，自动挑的空闲流）")
         self.log("回调接线    : " + ("工程已有 HAL 回调 -> 插转发" if (scan.cb_rx_file or scan.cb_err_file)
                                      else "工程没有 HAL 回调 -> 在移植层里定义"))
+        if scan.rs485_pol:
+            self.log(f"硬件 RS485  : 工程用 USART 硬件 DE（{scan.rs485_pol}，"
+                     f"assert={scan.rs485_at} deassert={scan.rs485_dt}）"
+                     "—— 改波特率后会重新调 HAL_RS485Ex_Init 恢复，否则 DE 不动作")
         for w in scan.warnings:
             self.log(f"[注意] {w}")
 
@@ -757,6 +779,21 @@ static void UG_Port_DmaInit(void)
 
         dma_call = "    UG_Port_DmaInit();\n" if dma_installer else ""
 
+        # 工程用「硬件 RS485」（CubeMX 的 RS485/DE 模式）时：改波特率会清掉 DEM 位，
+        # 必须在 HAL_UART_Init() 之后用同样的参数重新调一次 HAL_RS485Ex_Init()。
+        if scan.rs485_pol:
+            rs485_fix = f"""
+    /* 这一路是「硬件 RS485」：DE 由 USART 自己翻转（工程里 HAL_RS485Ex_Init 配的）。
+     * HAL_UART_Init() 会把 CR1/CR3 清零、DEM 位丢失 → DE 不再动作、总线上什么都发不出去，
+     * 所以改完波特率要重新配置一次硬件 DE。 */
+    if (HAL_RS485Ex_Init(&{uart_name}, {scan.rs485_pol}, {scan.rs485_at}, {scan.rs485_dt}) != HAL_OK)
+    {{
+        Error_Handler();
+    }}
+"""
+        else:
+            rs485_fix = ""
+
         # 串口句柄必须先声明：UG_Port_DmaInit() 里有 __HAL_LINKDMA(&huartX, ...)
         if scan.uart_owned_by == "project":
             uart_decl = f"""/* 复用工程已有的 {inst} 句柄（定义在 usart.c 或 main.c 里） */
@@ -780,7 +817,7 @@ static void UG_Port_UartInit(void)
             Error_Handler();
         }}
     }}
-
+{rs485_fix}
     /* 空闲中断靠串口全局中断：CubeMX 里没勾的话这里补上（重复使能无副作用） */
     HAL_NVIC_SetPriority({inst}_IRQn, {irq_prio}, 0);
     HAL_NVIC_EnableIRQ({inst}_IRQn);

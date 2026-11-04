@@ -6,7 +6,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Unitree_GO 一键配置  v1.2.1                                │
+│  Unitree_GO 一键配置  v1.3.0                                │
 │                                                             │
 │  1. 选择 Keil 工程目录（MDK-ARM）                            │
 │  [ D:\27RC\dm_demo\MDK-ARM                     ] [浏览…] [仅检测] │
@@ -439,6 +439,38 @@ GUI 里选「3（自选串口）」，填串口名 / 方向脚 / 波特率即可
 - 波特率默认 4 Mbps（GO-M8010-6 的固定值）。直连其它普通串口设备时记得 `--baud` 跟对方一致；
 - 指定的串口在工程里找不到时，工具会直接报错并提示两种解决办法（CubeMX 里加，或改用通道 1/2）。
 
+#### 5.7.1 如果 CubeMX 里用的是「RS485 / 硬件 DE」模式
+
+CubeMX 的 `USARTx → Hardware Flow Control (RS485)` / `DE` 引脚模式，会生成：
+
+```c
+huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+HAL_RS485Ex_Init(&huart1, UART_DE_POLARITY_HIGH, 0, 0);   /* 设置 CR3 的 DEM 位 + DEAT/DEDT */
+```
+
+这里的 **DE 是由 USART 外设自动翻转的，不是 GPIO**，所以工具/驱动侧：
+
+- **不要**再传 `--de`（传了会变成"GPIO + 硬件 DE"双重控制）；
+- 生成的 `UG_PORT_DE_PORT` 是 `NULL`，驱动不碰方向脚，靠硬件 DEM。
+
+**坑**：`HAL_UART_Init()` 内部 `UART_SetConfig()` 会把 `CR1 = 0`、`CR3 = 0` —— **顺手把 DEM（Driver Enable）位和 DEAT/DEDT 一起清掉**。移植层改波特率时正好会调 `HAL_UART_Init()`，于是硬件 DE 失效、`DE` 引脚再也不翻转 → 总线上一个字都发不出去（现象：`ok_cnt = 0`、`timeout_cnt` 猛涨、`rx_size = 0`、`crc_err_cnt = 0`，用示波器看 A/B 上什么都没有）。
+
+所以工具会**自动检测**工程里的 `HAL_RS485Ex_Init(&huartx, 极性, 断言时间, 释放时间)`，并在改完波特率后原样重新调用一次：
+
+```c
+if ((huart1.Instance == USART1) && (huart1.Init.BaudRate != UG_PORT_BAUD))
+{
+    huart1.Init.BaudRate = UG_PORT_BAUD;
+    if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
+}
+/* 硬件 RS485：HAL_UART_Init() 清掉了 DEM，这里补回来 */
+if (HAL_RS485Ex_Init(&huart1, UART_DE_POLARITY_HIGH, 0, 0) != HAL_OK) { Error_Handler(); }
+```
+
+日志里会有一行 `硬件 RS485 : 工程用 USART 硬件 DE（…）` 提示检测到了。
+
+> 若不想让工具改波特率，直接把 CubeMX 里这一路的波特率设成目标值（4 Mbps），工具发现 `huart->Init.BaudRate == UG_PORT_BAUD` 就不会重新初始化，DE 配置天然保留。
+
 
 ---
 
@@ -720,6 +752,7 @@ if (Unitree_GO_Poll(&go)) { /* 新反馈到了 */ }
 
 ## 版本
 
+- **v1.3.0** — 支持 CubeMX 的**硬件 RS485（DE 由 USART 自动翻转）**：工具自动识别工程里的 `HAL_RS485Ex_Init(&huartx, 极性, 断言, 释放)`，并在改波特率后原样重新调用一次——否则 `HAL_UART_Init()` 里 `UART_SetConfig()` 会把 `CR3` 的 DEM 位清零，DE 不再动作、总线上什么都发不出去（`ok_cnt=0` / `timeout_cnt` 猛涨 / `rx_size=0`）。见 [5.7.1](#571-如果-cubemx-里用的是rs485--硬件-de模式)。
 - **v1.2.1** — 修 GUI 选「3（自选串口）」时的 `KeyError: '3'`：`_port_files()` 里还残留按通道号查 `channel_map` 的老代码（自选串口不走那张表）；`_spec()` 对 `channel == 3` 但没填串口名也给出明确提示而不是抛异常。
 - **v1.2.0** — 新增**自选串口（通道 3）**：`--uart USART1…` + `--de PIN`（可省略 = 无方向脚）+ `--baud N`。用于板载 485 只引出 A/B 两线、或要直连三线 TTL 串口的场合：任意 UART、可选方向脚、自动推导 DMA 请求、复用工程里已配好的句柄（不会重复定义）、缺中断入口/回调时自动补；GUI 里也加了「3（自选串口）」。
 - **v1.1.2** — 修生成的 `Unitree_GO_port.c` 的两个编译问题（已在 Keil AC5 + 该工程 HAL 上实编验证）：
